@@ -69,7 +69,7 @@ extension RecorderSmokeTests {
 
 
 extension RecorderSmokeTests {
-    func testSyntheticForegroundUnlockDismissRetryAndBackgroundLock() {
+    func testSyntheticUnlockSwitchingManualLockAndColdLaunch() {
         let app = XCUIApplication(); app.launchArguments = ["--synthetic-review", "--synthetic-unlock"]; app.launch()
         let unlock = app.buttons["identityUnlockButton"]
         XCTAssertTrue(unlock.waitForExistence(timeout:10))
@@ -94,6 +94,15 @@ extension RecorderSmokeTests {
         app.navigationBars.buttons.element(boundBy:0).tap(); app.buttons["Identity"].tap()
         XCTAssertTrue(app.staticTexts["Imported identity · unlocked"].exists)
         XCUIDevice.shared.press(.home); app.activate()
+        XCTAssertTrue(app.staticTexts["Imported identity · unlocked"].waitForExistence(timeout:10))
+        XCTAssertFalse(unlock.exists)
+        app.buttons["Lock"].tap()
+        XCTAssertTrue(app.staticTexts["Imported identity · locked"].waitForExistence(timeout:5))
+        XCUIDevice.shared.press(.home); app.activate()
+        XCTAssertTrue(unlock.waitForExistence(timeout:10))
+        let manualPIN = app.secureTextFields["identityUnlockPIN"]; manualPIN.tap(); manualPIN.typeText("123456"); unlock.tap()
+        XCTAssertTrue(app.buttons["menuButton"].waitForExistence(timeout:5))
+        app.terminate(); app.launch()
         XCTAssertTrue(unlock.waitForExistence(timeout:10))
     }
 }

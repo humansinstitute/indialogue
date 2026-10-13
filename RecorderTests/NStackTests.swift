@@ -375,3 +375,142 @@ extension NStackTests {
         XCTAssertEqual(try Data(contentsOf:audio),Data([1,2,3]))
     }
 }
+
+extension NStackTests {
+    func testCanonicalAgentIdentityOverridesLegacyPresentationAndPermissionFlags() throws {
+        let legacy = NostrCodec.npub(Data(repeating:2,count:32))
+        let entries: [[String:Any]] = [
+            ["agent_npub":npub,"display_name":"Rick","actor":["npub":legacy,"label":"Legacy"],"is_visible":true,"metadata":["can_instruct":true]],
+            ["agent_npub":legacy,"display_name":"Hidden","is_visible":false],
+            ["agent_npub":legacy,"display_name":"Denied","metadata":["can_instruct":false]],
+            ["agent_npub":legacy,"display_name":"Archived","archived_at":"2026-01-01"],
+            ["agent_npub":"invalid","display_name":"Never infer","actor":["npub":legacy]],
+        ]
+        let agents = try NStackDiscovery.agents(["workspace_agents":entries])
+        XCTAssertEqual(agents.map(\.id),[npub]); XCTAssertEqual(agents.map(\.label),["Rick"])
+        XCTAssertTrue(try NStackDiscovery.agents(["workspace_agents":[]]).isEmpty)
+        XCTAssertThrowsError(try NStackDiscovery.agents(["error":"denied"]))
+    }
+
+    func testChannelTitlesAndDMParticipantNamesNeverBecomeRoutingAuthority() throws {
+        let other = NostrCodec.npub(Data(repeating:2,count:32)); let id = UUID().uuidString
+        let labels = NStackDiscovery.memberLabels([["actor":["npub":other,"display_name":"Colleague"]]])
+        let scope: [String:Any] = ["name":"DMs"]
+        let dm: [String:Any] = ["id":id,"name":"DM: " + other,"kind":"dm","participant_npubs":[npub,other]]
+        XCTAssertEqual(try NStackDiscovery.channel(dm,scope:scope,signer:npub,labels:labels).label,"DMs / Colleague · DM")
+        var intentional = dm; intentional["name"] = "DM: Audio review"
+        XCTAssertEqual(try NStackDiscovery.channel(intentional,scope:scope,signer:npub,labels:labels).label,"DMs / DM: Audio review · DM")
+        var named = dm; named["title"] = "Recording discussion"
+        XCTAssertEqual(try NStackDiscovery.channel(named,scope:scope,signer:npub,labels:labels).label,"DMs / Recording discussion · DM")
+        XCTAssertEqual(try NStackDiscovery.channel(["id":id,"title":"Actual title","name":"Fallback","kind":"channel"],scope:["title":"Actual scope"],signer:npub,labels:[:]).label,"Actual scope / Actual title")
+        XCTAssertTrue(try NStackDiscovery.agents(["workspace_agents":[]]).isEmpty) // Human DM participants are labels, never agents.
+    }
+
+    func testFullDiscoveryAcrossScopesAndCursorPagesBeyondDefaultLimit() async throws {
+        let workspace = NStackChoice(id:UUID().uuidString,label:"Workspace",app:npub)
+        let scope = UUID().uuidString, dmScope = UUID().uuidString, dmID = UUID().uuidString
+        let other = NostrCodec.npub(Data(repeating:2,count:32))
+        let rows: [[String:Any]] = (0..<61).map { ["id":UUID().uuidString,"title":"Channel \($0)","kind":"channel"] }
+        var channelRequests = 0
+        MockNStackProtocol.handler = { request in
+            let url = request.url!; let query = URLComponents(url:url,resolvingAgainstBaseURL:false)!.queryItems ?? []
+            if url.lastPathComponent != "sync" && url.lastPathComponent != "me" { XCTAssertEqual(query.first { $0.name == "limit" }?.value,"200") }
+            switch url.path.components(separatedBy:"/").last! {
+            case "sync", "me": return (404,[:])
+            case "workspace-agents": return (200,["workspace_agents":[["agent_npub":other,"display_name":"Rick"]],"next_cursor":NSNull()])
+            case "members": return (200,["members":[["actor":["npub":self.npub,"display_name":"Me"]]]])
+            case "scopes": return (200,["scopes":[["id":scope,"name":"Home"],["id":dmScope,"name":"DMs"]]])
+            case "channels":
+                channelRequests += 1
+                if url.path.contains(dmScope) { return (200,["channels":[["id":dmID,"name":"DM: " + other,"kind":"dm","participant_npubs":[self.npub,other]]]]) }
+                if let cursor = query.first(where: { $0.name == "cursor" }) { XCTAssertEqual(cursor.value,"page+/= 2"); return (200,["channels":Array(rows.dropFirst(50))]) }
+                return (200,["channels":Array(rows.prefix(50)),"next_cursor":"page+/= 2"])
+            default: XCTFail("Unexpected discovery route"); return (404,[:])
+            }
+        }
+        let result = try await api().discoverChannels(origin:"https://nstack.example",workspace:workspace,signer:npub)
+        XCTAssertEqual(result.channels.count,62); XCTAssertEqual(channelRequests,3)
+        XCTAssertEqual(result.channels.last?.label,"DMs / Rick · DM")
+        XCTAssertEqual(result.agents.first?.id,other); XCTAssertNil(result.directoryError)
+    }
+
+    func testDirectoryFailureIsDistinctFromEmptyAndDoesNotHideChannels() async throws {
+        let workspace = NStackChoice(id:UUID().uuidString,label:"Workspace",app:npub)
+        let scope = UUID().uuidString
+        for denied in [true,false] {
+            MockNStackProtocol.handler = { request in
+                switch request.url!.lastPathComponent {
+                case "workspace-agents": return denied ? (403,["error":"denied"]) : (200,["workspace_agents":[]])
+                case "members": return (403,[:])
+                case "scopes": return (200,["scopes":[["id":scope,"name":"Home"]]])
+                default: return (200,["channels":[["id":UUID().uuidString,"name":"General"]]])
+                }
+            }
+            let result = try await api().discoverChannels(origin:"https://nstack.example",workspace:workspace,signer:npub)
+            XCTAssertEqual(result.channels.count,1); XCTAssertTrue(result.agents.isEmpty)
+            XCTAssertEqual(result.directoryError != nil,denied); XCTAssertNotNil(result.labelNotice)
+        }
+    }
+
+    func testDiscoveryRejectsCursorLoopsAndUnpageableServerCap() async throws {
+        MockNStackProtocol.handler = { _ in (200,["channels":[],"next_cursor":"repeated"]) }
+        do { _ = try await api().list(origin:"https://nstack.example",path:"/api/v4/channels",key:"channels"); XCTFail("Cursor loop accepted") } catch { XCTAssertTrue(error is NStackError) }
+        MockNStackProtocol.handler = { _ in (200,["channels":Array(repeating:["id":"fixture"],count:200),"next_cursor":NSNull()]) }
+        do { _ = try await api().list(origin:"https://nstack.example",path:"/api/v4/channels",key:"channels"); XCTFail("Unproven full discovery accepted") } catch NStackError.discoveryLimit {} catch { XCTFail("Wrong error: \(error)") }
+    }
+}
+
+
+extension NStackTests {
+    func testSavedSetupRestoresExactSelectionsWithoutRetargeting() {
+        let saved = destination()
+        let selections = NStackDiscovery.savedSelections(saved)
+        XCTAssertEqual(selections.workspace.id,saved.workspace)
+        XCTAssertEqual(selections.workspace.label,saved.workspaceLabel)
+        XCTAssertEqual(selections.workspace.app,saved.appNpub)
+        XCTAssertEqual(selections.channel.id,saved.channel)
+        XCTAssertEqual(selections.channel.label,saved.channelLabel)
+    }
+}
+
+extension NStackTests {
+    func testSyncMetadataDiscoversBeyondScopeListCapWithoutPagingMessageHistory() async throws {
+        let scope = UUID().uuidString
+        let rows: [[String:Any]] = (0..<251).map { ["id":UUID().uuidString,"scope_id":scope,"name":"Channel \($0)"] }
+        var syncRequests = 0
+        MockNStackProtocol.handler = { request in
+            switch request.url!.lastPathComponent {
+            case "workspace-agents": return (200,["workspace_agents":[]])
+            case "members": return (200,["members":[]])
+            case "sync":
+                syncRequests += 1
+                XCTAssertEqual(request.url!.query,"limit=1")
+                return (200,["full_snapshot":true,"snapshot_complete":false,"has_more":true,"next_cursor":"message-bundle-page","scopes":[["id":scope,"name":"Home"]],"channels":rows])
+            default: XCTFail("Scope list or unrelated message pagination requested"); return (404,[:])
+            }
+        }
+        let result = try await api().discoverChannels(origin:"https://nstack.example",workspace:NStackChoice(id:UUID().uuidString,label:"Workspace",app:npub),signer:npub)
+        XCTAssertEqual(result.channels.count,251); XCTAssertEqual(syncRequests,1)
+        XCTAssertNil(result.channelError); XCTAssertNil(result.labelNotice)
+    }
+
+    func testDirectlyGrantedChannelsIncludedInFallbackAndAgentsSurviveChannelFailure() async throws {
+        let scope = UUID().uuidString, directScope = UUID().uuidString, directID = UUID().uuidString
+        for failChannels in [false,true] {
+            MockNStackProtocol.handler = { request in
+                switch request.url!.lastPathComponent {
+                case "workspace-agents": return (200,["workspace_agents":[["agent_npub":self.npub,"display_name":"Rick"]]])
+                case "members": return (200,["members":[]])
+                case "sync": return (404,[:])
+                case "scopes": return (200,["scopes":[["id":scope,"name":"Home"]]])
+                case "me": return (200,["visible":["scopes":[["id":directScope,"name":"DMs"]],"channels":[["id":directID,"scope_id":directScope,"name":"Intentional DM name","kind":"dm"]]]])
+                default: return failChannels ? (403,[:]) : (200,["channels":[]])
+                }
+            }
+            let result = try await api().discoverChannels(origin:"https://nstack.example",workspace:NStackChoice(id:UUID().uuidString,label:"Workspace",app:npub),signer:npub)
+            XCTAssertEqual(result.agents.first?.label,"Rick"); XCTAssertNil(result.directoryError)
+            XCTAssertEqual(result.channelError != nil,failChannels)
+            if !failChannels { XCTAssertEqual(result.channels.first?.id,directID); XCTAssertEqual(result.channels.first?.label,"DMs / Intentional DM name · DM"); XCTAssertNotNil(result.labelNotice) }
+        }
+    }
+}

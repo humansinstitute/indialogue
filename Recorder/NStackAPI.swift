@@ -22,10 +22,12 @@ struct NStackDestination: Codable, Equatable {
     }
 }
 enum NStackError: LocalizedError {
+    case discoveryLimit
     case invalidSetup, unsafeURL, response(Int), malformed, incomplete, fallbackLimit, prepareUncertain
     case snapshotMismatch, storageMetadata, storageMismatch, storageIncomplete
     var errorDescription: String? {
         switch self {
+        case .discoveryLimit: "NStack discovery reached a server list limit without a continuation cursor. Ask the administrator to provide paginated discovery; the list cannot be confirmed complete."
         case .invalidSetup: "Choose an HTTPS NStack, workspace, channel, unlocked identity and meaningful prompt. Check the recipient npub and label."
         case .unsafeURL: "NStack refused an unsafe URL or redirect. Use your selected HTTPS origin."
         case .response(let code): "NStack returned HTTP \(code). Check access and connection; local files retained."

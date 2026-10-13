@@ -37,7 +37,7 @@ struct IdentitySettings: View {
                 Button("Remove identity", role: .destructive) { model.perform { try $0.remove() }; clear() }
             }
             .alert("PINs do not match", isPresented: $mismatch) { Button("OK", role: .cancel) {} }
-            .onChange(of: scenePhase) { _, phase in if phase != .active { clear() }; if phase == .background { model.lock() } }
+            .onChange(of: scenePhase) { _, phase in if phase != .active { clear() } }
             .onDisappear { clear() }
     }
 }

@@ -4,7 +4,13 @@ import UIKit
 @main
 struct PeteRecorderApp: App {
     @StateObject private var model: RecorderModel
+    @StateObject private var identity: IdentityModel
     init() {
+        #if DEBUG && targetEnvironment(simulator)
+        _identity = StateObject(wrappedValue: ProcessInfo.processInfo.arguments.contains("--synthetic-unlock") ? SyntheticUnlockIdentity.make() : IdentityModel())
+        #else
+        _identity = StateObject(wrappedValue: IdentityModel())
+        #endif
         #if DEBUG && targetEnvironment(simulator)
         if ProcessInfo.processInfo.arguments.contains("--synthetic-review") {
             let root = FileManager.default.temporaryDirectory.appendingPathComponent("UIReview-" + UUID().uuidString)
@@ -18,15 +24,7 @@ struct PeteRecorderApp: App {
         #endif
         _model = StateObject(wrappedValue: RecorderModel())
     }
-    var body: some Scene { WindowGroup {
-        #if DEBUG && targetEnvironment(simulator)
-        if ProcessInfo.processInfo.arguments.contains("--synthetic-unlock") {
-            RecorderView(model: model, identity: SyntheticUnlockIdentity.make())
-        } else { RecorderView(model: model) }
-        #else
-        RecorderView(model: model)
-        #endif
-    } }
+    var body: some Scene { WindowGroup { RecorderView(model:model,identity:identity) } }
 }
 
 struct ShareFile: Identifiable { let id = UUID(); let url: URL }
@@ -90,7 +88,7 @@ struct RecorderView: View {
                 .sheet(isPresented: $micOpen, onDismiss: { requestUnlock() }) { microphones }
                 .onChange(of: scenePhase) { _, phase in
                     if phase == .active { model.foreground(); requestUnlock() }
-                    else if phase == .background { unlockOpen = false; unlockPolicy.background(); identity.lock(); model.background() }
+                    else if phase == .background { unlockOpen = false; unlockPolicy.background(); model.background() }
                 }
                 .onChange(of: model.message) { _, value in if value != nil { criticalNotice = true } }
                 .alert("Recorder notice", isPresented: $criticalNotice) {
