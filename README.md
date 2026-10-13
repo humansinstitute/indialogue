@@ -1,4 +1,4 @@
-# Pete Recorder
+# In Dialogue
 
 Native SwiftUI iPhone recorder, version 1.2 (build 3), for iOS 18+. Open `Recorder.xcodeproj` in Xcode 26.3 and select `PeteRecorder`.
 

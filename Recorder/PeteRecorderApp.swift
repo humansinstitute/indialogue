@@ -61,7 +61,7 @@ struct RecorderView: View {
                 }.buttonStyle(.borderedProminent).tint(.red)
                     .disabled((model.busy && !model.preparingUpload) || model.store == nil).accessibilityIdentifier("recordButton")
                 Spacer()
-            }.padding(24).navigationTitle("Pete Recorder")
+            }.padding(24).navigationTitle("In Dialogue")
                 .toolbar {
                     ToolbarItem(placement: .topBarLeading) {
                         Button { menuOpen = true } label: {
