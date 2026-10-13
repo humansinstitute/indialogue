@@ -177,6 +177,7 @@ final class RecorderModel: NSObject, ObservableObject, AVAudioRecorderDelegate, 
         do { try persist(edited); replace(edited) } catch { report(error) }
     }
     func delete(_ r: Recording) {
+        guard !busy else { return }
         if playing == r.id { stopPlayback() }
         do { try store?.delete(r); recordings.removeAll { $0.id == r.id } } catch { report(error) }
     }
@@ -249,8 +250,12 @@ final class RecorderModel: NSObject, ObservableObject, AVAudioRecorderDelegate, 
         busy = true; transcribing = true
         defer { busy = false; transcribing = false; transcriptionTask = nil }
         do {
-            guard let store else { throw RecorderError.capture }
-            let text = try await LocalSpeech.transcribe(r.segments.map { store.audio(r, $0) }, download: download)
+            // Analyze one continuous file so speech has a single timeline and context
+            // across capture segments. Export retains and reports unreadable sources.
+            let audio = try await export(r)
+            defer { try? FileManager.default.removeItem(at: audio) }
+            try Task.checkCancellation()
+            let text = try await LocalSpeech.transcribe([audio], download: download)
             var edited = r; edited.transcript = text.text; edited.transcriptionLocale = text.locale
             try persist(edited); replace(edited); speechStatus = await LocalSpeech.status()
         } catch is CancellationError { message = "Transcription cancelled. Saved audio retained." }
