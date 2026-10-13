@@ -1,6 +1,6 @@
 # In Dialogue
 
-Native SwiftUI iPhone recorder, version 1.3 (build 7), for iOS 18+. Open `Recorder.xcodeproj` in Xcode 26.3 and select `PeteRecorder`.
+Native SwiftUI iPhone recorder, version 1.3 (build 8), for iOS 18+. Open `Recorder.xcodeproj` in Xcode 26.3 and select `PeteRecorder`.
 
 The capture screen has a microphone preference control, a left menu and Start recording. During capture it shows the actual input, elapsed time, a live recording level history and Stop and save. The microphone picker requests permission and discovers iOS-supported inputs when opened. A preference is used when available; the actual capture route remains authoritative. Recordings, notices, identity and vocabulary live in the menu. Important audio failures also show an alert.
 
@@ -19,3 +19,5 @@ Audio, original/edited transcripts, drafts, vocabulary and recording metadata li
 See [installation](docs/INSTALLATION.md), [validation](docs/VALIDATION.md), and [NStack integration](docs/INTEGRATION.md).
 
 Microphone startup allows up to one second for an available preferred input to become the actual route. iOS remains authoritative; fallback/pending preference is recorded in diagnostics. Routine route notifications update the screen without an alert; only distinct actual input/data-source changes are logged. Lost input and interruptions still stop capture with a warning. The ten-second level history reads the existing AAC recorder at 4 Hz, continues across segments, clears on stop/foreground, and suspends metering while background capture continues. Reduce Motion shows a single current level; VoiceOver exposes a qualitative level without live announcements.
+
+Menu → Settings offers **Automatically delete recordings**, disabled by default, with a saved whole-day period from 1 to 3650 (initial value 30). Saving an enabled policy applies to existing recordings too: export anything important first. Age uses elapsed 24-hour days from recording creation, not last edit/upload. Local recording folders (audio, metadata, original/edited transcripts and drafts) and finished local upload snapshots and their transcript-bearing delivery entries are removed; uploaded workspace objects/messages remain. No cloud deletion is requested. Failed, paused, queued or active uploads, automatic upload intents, queued/running transcription, cleanup, capture and playback defer deletion safely. Unreadable upload ledgers and unavailable protected data prevent automatic deletion. Failures appear in Settings and retry at a later safe check. Checks run on launch/foreground, protected-data availability, and safe capture/playback/job completion; iOS does not run this cleanup while the app is closed.

@@ -21,6 +21,14 @@ final class RecorderModel: NSObject, ObservableObject, AVAudioRecorderDelegate, 
     private var selectedInputUID: String? = UserDefaults.standard.string(forKey: "preferredInputUID")
     private var vocabularyStore: VocabularyStore?
     private var vocabularyReadable = true
+    @Published private(set) var retention: RecordingRetention
+    @Published var retentionNotice: String?
+    private let retentionDefaults: UserDefaults
+    private let protectedDataAvailable: () -> Bool
+    private var exportsInProgress: [UUID: Int] = [:]
+    private var cleanupID: UUID?
+    private let cleanup: ((String, [VocabularyCorrection]) async throws -> String)?
+    var sharingID: UUID?
     private var suspended = false
     private var deferredTranscription = false
     private var downloadRequests: Set<UUID> = []
@@ -66,8 +74,15 @@ final class RecorderModel: NSObject, ObservableObject, AVAudioRecorderDelegate, 
 
     init(root requestedRoot: URL? = nil,
          speech: @escaping ([URL], Bool) async throws -> LocalTranscript = { try await LocalSpeech.transcribe($0, download: $1) },
-         audioExport: ((Recording) async throws -> URL)? = nil) {
-        self.speech = speech; self.audioExport = audioExport
+         audioExport: ((Recording) async throws -> URL)? = nil,
+         cleanup: ((String, [VocabularyCorrection]) async throws -> String)? = nil,
+         retentionDefaults: UserDefaults? = nil,
+         protectedDataAvailable: @escaping () -> Bool = { UIApplication.shared.isProtectedDataAvailable }) {
+        let defaults = retentionDefaults ?? requestedRoot.flatMap { UserDefaults(suiteName: "RecorderTests." + $0.lastPathComponent) } ?? .standard
+        self.retentionDefaults = defaults
+        self.retention = RecordingRetention.load(from: defaults)
+        self.protectedDataAvailable = protectedDataAvailable
+        self.speech = speech; self.audioExport = audioExport; self.cleanup = cleanup
         var loaded: [Recording] = []
         var failure: String?
         var candidate: RecordingStore?
@@ -92,7 +107,41 @@ final class RecorderModel: NSObject, ObservableObject, AVAudioRecorderDelegate, 
                 Task { @MainActor in self?.notification(note) }
             })
         }
+        transfers.onIdle = { [weak self] in self?.runRetention() }
+        observers.append(NotificationCenter.default.addObserver(forName: UIApplication.protectedDataDidBecomeAvailableNotification, object: nil, queue: .main) { [weak self] _ in
+            Task { @MainActor in self?.runRetention() }
+        })
+        runRetention()
         Task { speechStatus = await LocalSpeech.status(); resumeTranscriptionQueue(); resumeUploadSnapshots() }
+    }
+    func saveRetention(enabled: Bool, days: String) -> Bool {
+        guard let count = RecordingRetention.parseDays(days) else {
+            retentionNotice = RecordingRetention.validationMessage; return false
+        }
+        let policy = RecordingRetention(enabled: enabled, days: count)
+        do {
+            try policy.save(to: retentionDefaults); retention = policy; retentionNotice = nil
+            runRetention(); return true
+        } catch { retentionNotice = error.localizedDescription; return false }
+    }
+    /// Synchronous on the main actor: eligibility cannot race with a new job or playback.
+    func runRetention(now: Date = Date()) {
+        guard retention.enabled, !suspended, protectedDataAvailable(), let store,
+              !capturePending, !busy, snapshotTask == nil, transfers.retentionReady else { return }
+        if retentionNotice?.hasPrefix("Automatic deletion could not finish.") == true { retentionNotice = nil }
+        for r in recordings where retention.expires(r, now: now) {
+            guard r.state != .recording, active?.id != r.id, playing != r.id,
+                  transcriptionID != r.id, cleanupID != r.id, exportsInProgress[r.id, default: 0] == 0, sharingID != r.id,
+                  ![.queued, .running].contains(r.transcriptionState),
+                  !transfers.retentionProtects(r.id) else { continue }
+            do {
+                try transfers.deleteFinishedLocalArtifacts(r.id)
+                try store.delete(r)
+                recordings.removeAll { $0.id == r.id }
+            } catch {
+                retentionNotice = "Automatic deletion could not finish. It will retry when the app is active: \(error.localizedDescription)"
+            }
+        }
     }
     func refreshRoute() {
         let availableInputs = session.availableInputs
@@ -234,6 +283,7 @@ final class RecorderModel: NSObject, ObservableObject, AVAudioRecorderDelegate, 
             recordings.removeAll { $0.id == r.id }; recordings.insert(r, at: 0)
         }
         active = nil; elapsed = 0
+        runRetention()
         try? session.setActive(false, options: .notifyOthersOnDeactivation)
         refreshRoute()
         resumeTranscriptionQueue()
@@ -327,8 +377,10 @@ final class RecorderModel: NSObject, ObservableObject, AVAudioRecorderDelegate, 
             do { try self.playSegment() } catch { self.report(error); self.stopPlayback() }
         }
     }
-    func stopPlayback() { player?.stop(); player = nil; playing = nil; playbackRecord = nil; if active == nil { try? session.setActive(false, options: .notifyOthersOnDeactivation) } }
+    func stopPlayback() { Task { @MainActor [weak self] in self?.runRetention() }; player?.stop(); player = nil; playing = nil; playbackRecord = nil; if active == nil { try? session.setActive(false, options: .notifyOthersOnDeactivation) } }
     func export(_ r: Recording, requireComplete: Bool = false) async throws -> URL {
+        exportsInProgress[r.id, default: 0] += 1
+        defer { exportsInProgress[r.id, default: 0] -= 1 }
         if requireComplete && r.state != .saved { throw NStackError.incomplete }
         guard let store else { throw RecorderError.capture }
         let composition = AVMutableComposition()
@@ -388,7 +440,7 @@ final class RecorderModel: NSObject, ObservableObject, AVAudioRecorderDelegate, 
     func background() { recorder?.isMeteringEnabled = false; levels.pause(); snapshotTask?.cancel(); suspended = true; deferTranscription(); cancelCleanup() }
     func foreground() {
         suspended = false; recorder?.isMeteringEnabled = true; levels.pause()
-        refreshRoute(); resumeTranscriptionQueue(); resumeUploadSnapshots()
+        refreshRoute(); runRetention(); resumeTranscriptionQueue(); resumeUploadSnapshots()
         #if DEBUG && targetEnvironment(simulator)
         if syntheticFeedback { showSyntheticCaptureFeedback() }
         #endif
@@ -397,7 +449,7 @@ final class RecorderModel: NSObject, ObservableObject, AVAudioRecorderDelegate, 
         transcribing = true
         defer {
             transcribing = false; transcriptionID = nil; transcriptionTask = nil
-            resumeTranscriptionQueue(); resumeUploadSnapshots()
+            runRetention(); resumeTranscriptionQueue(); resumeUploadSnapshots()
         }
         do {
             try Task.checkCancellation()
@@ -439,7 +491,7 @@ final class RecorderModel: NSObject, ObservableObject, AVAudioRecorderDelegate, 
         guard let d = destination ?? transfers.intents.first(where: { $0.recordingID == r.id })?.destination ?? transfers.destination else { message = "Configure NStack first."; return }
         snapshotTask = Task {
             busy = true
-            defer { busy = false; snapshotTask = nil; resumeTranscriptionQueue(); resumeUploadSnapshots() }
+            defer { busy = false; snapshotTask = nil; runRetention(); resumeTranscriptionQueue(); resumeUploadSnapshots() }
             do {
                 guard r.transcriptionState == .complete else { throw NStackError.incomplete }
                 let corrected = TranscriptCorrections.apply(r.reviewText, vocabulary:vocabulary)
@@ -466,12 +518,15 @@ final class RecorderModel: NSObject, ObservableObject, AVAudioRecorderDelegate, 
     }
     func cleanUp(_ id: UUID) {
         guard cleanupTask == nil, active == nil, let r = recordings.first(where: { $0.id == id }), !r.reviewText.isEmpty else { return }
+        cleanupID = id
         cleaning = true; cleanupStatus = "Cleaning up on device…"
         let source = r.reviewText; let rules = vocabulary
         cleanupTask = Task {
-            defer { cleanupTask = nil; cleaning = false }
+            defer { cleanupTask = nil; cleanupID = nil; cleaning = false; runRetention() }
             do {
-                let draft = try await LocalCleanup.draft(source, vocabulary: rules) { [weak self] progress in self?.cleanupStatus = progress }
+                let draft: String
+                if let cleanup { draft = try await cleanup(source, rules) }
+                else { draft = try await LocalCleanup.draft(source, vocabulary: rules) { [weak self] progress in self?.cleanupStatus = progress } }
                 try Task.checkCancellation()
                 guard var latest = recordings.first(where: { $0.id == id }), latest.reviewText == source else { cleanupStatus = "Transcript changed; request a new draft."; return }
                 latest.cleanupDraft = draft; try persist(latest); replace(latest)

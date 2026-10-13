@@ -88,6 +88,25 @@ final class NStackTransfers: ObservableObject {
             }
         } catch { readable = false; notice = "Transfer ledger unreadable; retained and cannot be overwritten. \(error.localizedDescription)" }
     }
+    var onIdle: (() -> Void)?
+    var retentionReady: Bool { readable && worker == nil }
+    func retentionProtects(_ id: UUID) -> Bool {
+        intents.contains { $0.recordingID == id } || jobs.contains {
+            $0.recordingID == id && !["sent", "cancelled"].contains($0.state)
+        }
+    }
+    /// Remove finished local snapshots and their transcript-bearing ledger entries; never remote objects.
+    func deleteFinishedLocalArtifacts(_ id: UUID) throws {
+        guard retentionReady, !retentionProtects(id) else { throw NStackError.incomplete }
+        for job in jobs where job.recordingID == id {
+            let directory = root.appendingPathComponent(job.id.uuidString)
+            if FileManager.default.fileExists(atPath: directory.path) { try FileManager.default.removeItem(at: directory) }
+        }
+        let previous = jobs
+        jobs.removeAll { $0.recordingID == id }
+        do { try persist() }
+        catch { jobs = previous; throw error }
+    }
     func persist() throws {
         guard readable else { throw NStackError.malformed }
         try JSONEncoder().encode(Ledger(jobs: jobs, intents: intents, destination: destination)).write(to: root.appendingPathComponent("ledger.json"), options: [.atomic, .completeFileProtectionUntilFirstUserAuthentication])
@@ -158,7 +177,7 @@ final class NStackTransfers: ObservableObject {
     func resume() {
         guard readable, allowed, worker == nil, jobs.contains(where: { $0.state == "queued" && $0.destination.signer == currentSigner }), let api else { return }
         worker = Task {
-            defer { worker = nil; if allowed { resume() } }
+            defer { worker = nil; onIdle?(); if allowed { resume() } }
             while let i = jobs.firstIndex(where: { $0.state == "queued" && $0.destination.signer == currentSigner }), allowed, !Task.isCancelled {
                 do { try await send(i, api:api) }
                 catch {

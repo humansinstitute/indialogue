@@ -34,3 +34,5 @@ No `-allowProvisioningUpdates` is used: missing signing assets should be handled
 Microphone denial: Settings → Privacy & Security → Microphone → Pete Recorder. An active recording must start after first unlock following reboot. Subsequent locking is supported by the audio background mode and file protection policy, subject to physical-device validation.
 
 For the recorder feedback update, rebuild version 1.3 **build 7** from the reviewed commit before Rick's signed in-place installation. Existing build 6 signed artifacts do not contain these fixes. Keep the same bundle ID, team and installation; complete the microphone/level-history physical checks in VALIDATION.md after installation.
+
+For automatic retention, rebuild version 1.3 **build 8** from the reviewed commit before Rick's signed in-place installation. Menu → Settings defaults to deletion off. Verify that the previous library and identity remain available after updating; do not enable retention on real recordings during review unless Pete chooses to do so. Simulator fixtures exercise deletion only in isolated temporary libraries. Build 7 signed artifacts do not include retention.

@@ -216,3 +216,31 @@ struct IdentityUnlock: View {
             .onChange(of: scenePhase) { _, phase in if phase != .active { pin = "" } }
     }
 }
+
+
+struct RecordingRetentionSettings: View {
+    @ObservedObject var model: RecorderModel
+    @State private var enabled = false
+    @State private var days = "30"
+    @FocusState private var editingDays: Bool
+    var body: some View {
+        Form {
+            Section("Automatic deletion") {
+                Toggle("Automatically delete recordings", isOn: $enabled).accessibilityIdentifier("retentionEnabled")
+                TextField("Days to keep recordings", text: $days).keyboardType(.numberPad).focused($editingDays)
+                    .accessibilityIdentifier("retentionDays")
+                Text("Choose 1–3650 whole days. Age is measured from when recording started.").font(.footnote)
+                Button("Save settings") { editingDays = false; _ = model.saveRetention(enabled: enabled, days: days) }
+                    .accessibilityIdentifier("saveRetention")
+                if let notice = model.retentionNotice { Text(notice).accessibilityIdentifier("retentionNotice") }
+                Text(model.retention.enabled ? "Saved: delete after \(model.retention.days) days." : "Saved: automatic deletion is off.")
+            }
+            Section {
+                Text("Deletes local recordings, audio, transcripts and finished local upload copies. Uploaded workspace copies remain.")
+                Text("Checks when you open or return to the app and after local work finishes. iOS does not run this cleanup while the app is closed. Active recording, playback and unfinished upload, transcription or cleanup work are kept until safe to delete.")
+                Text("Enabling this applies to existing recordings too. Export anything you want to keep before saving.")
+            }
+        }.navigationTitle("Settings")
+            .onAppear { enabled = model.retention.enabled; days = String(model.retention.days) }
+    }
+}

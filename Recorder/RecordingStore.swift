@@ -103,5 +103,16 @@ final class RecordingStore {
         }
         return records
     }
-    func delete(_ r: Recording) throws { try FileManager.default.removeItem(at: directory(r.id)) }
+    func delete(_ r: Recording) throws {
+        // Combined exports have an exact recording UUID + export UUID filename.
+        // Remove these local copies too, including copies left by a previous process.
+        let prefix = r.id.uuidString + "-"
+        for url in try FileManager.default.contentsOfDirectory(at: FileManager.default.temporaryDirectory, includingPropertiesForKeys: nil) {
+            let name = url.deletingPathExtension().lastPathComponent
+            guard url.pathExtension == "m4a", name.hasPrefix(prefix),
+                  UUID(uuidString: String(name.dropFirst(prefix.count))) != nil else { continue }
+            try FileManager.default.removeItem(at: url)
+        }
+        try FileManager.default.removeItem(at: directory(r.id))
+    }
 }

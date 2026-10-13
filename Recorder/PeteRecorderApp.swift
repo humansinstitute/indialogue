@@ -12,6 +12,11 @@ struct PeteRecorderApp: App {
         _identity = StateObject(wrappedValue: IdentityModel())
         #endif
         #if DEBUG && targetEnvironment(simulator)
+        if ProcessInfo.processInfo.arguments.contains("--synthetic-retention") {
+            let root = FileManager.default.temporaryDirectory.appendingPathComponent("UIRetention-" + UUID().uuidString)
+            _model = StateObject(wrappedValue: RecorderModel(root: root))
+            return
+        }
         if ProcessInfo.processInfo.arguments.contains("--synthetic-meter") {
             let root = FileManager.default.temporaryDirectory.appendingPathComponent("UIMeter-" + UUID().uuidString)
             let model = RecorderModel(root: root)
@@ -103,7 +108,7 @@ struct RecorderView: View {
                     Button("OK", role: .cancel) {}
                 } message: { Text(model.message ?? "See Notices in the menu.") }
                 .sheet(item: $selected, onDismiss: { requestUnlock() }) { r in details(r) }
-                .sheet(item: $share, onDismiss: { requestUnlock() }) { ShareSheet(url: $0.url) }
+                .sheet(item: $share, onDismiss: { model.sharingID = nil; model.runRetention(); requestUnlock() }) { ShareSheet(url: $0.url) }
                 .alert("Rename recording", isPresented: Binding(get: { renameTarget != nil }, set: { if !$0 { renameTarget = nil } })) {
                     TextField("Recording name", text: $renameText)
                     Button("Save") { if let r = renameTarget { model.rename(r, title: renameText) }; renameTarget = nil }
@@ -160,6 +165,7 @@ struct RecorderView: View {
                     NavigationLink("NStack") { NStackSettings(transfers:transfers,identity:identity) }
                     NavigationLink("NStack uploads") { NStackHistory(transfers:transfers) }
                     NavigationLink("Identity") { IdentitySettings(model: identity) }
+                    NavigationLink("Settings") { RecordingRetentionSettings(model: model) }
                     NavigationLink("Vocabulary") { VocabularySettings(model: model) }
                     NavigationLink("Notices and status") {
                         List {
@@ -201,9 +207,10 @@ struct RecorderView: View {
                     Button("Share AAC m4a", systemImage: "square.and.arrow.up") {
                         selected = nil
                         Task {
+                            model.sharingID = r.id
                             model.busy = true
                             defer { model.busy = false }
-                            do { share = ShareFile(url: try await model.export(r)) } catch { model.report(error) }
+                            do { share = ShareFile(url: try await model.export(r)) } catch { model.sharingID = nil; model.report(error) }
                         }
                     }.disabled(model.busy || model.active != nil)
                     Button("Rename", systemImage: "pencil") { selected = nil; renameText = r.title; renameTarget = r }.disabled(model.busy)

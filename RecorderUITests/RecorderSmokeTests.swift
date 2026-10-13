@@ -116,3 +116,28 @@ extension RecorderSmokeTests {
         let image = XCTAttachment(screenshot: app.screenshot()); image.name = "Synthetic live recording levels"; image.lifetime = .keepAlways; add(image)
     }
 }
+
+extension RecorderSmokeTests {
+    func testRetentionSettingsValidationAndSaveWithoutUserLibrary() {
+        let app = XCUIApplication(); app.launchArguments = ["--synthetic-retention"]; app.launch()
+        XCTAssertTrue(app.buttons["menuButton"].waitForExistence(timeout: 10)); app.buttons["menuButton"].tap()
+        app.buttons["Settings"].tap()
+        XCTAssertTrue(app.staticTexts["Saved: automatic deletion is off."].waitForExistence(timeout: 5))
+        let toggle = app.switches["retentionEnabled"]
+        XCTAssertEqual(toggle.value as? String, "0")
+        toggle.coordinate(withNormalizedOffset: CGVector(dx: 0.93, dy: 0.5)).tap()
+        XCTAssertEqual(toggle.value as? String, "1")
+        let days = app.textFields["retentionDays"]; days.tap()
+        days.typeText(String(repeating: XCUIKeyboardKey.delete.rawValue, count: 2) + "0")
+        app.buttons["saveRetention"].tap()
+        XCTAssertTrue(app.staticTexts["Enter a whole number of days from 1 to 3650."].waitForExistence(timeout: 5))
+        days.tap(); days.typeText(XCUIKeyboardKey.delete.rawValue + "7")
+        app.buttons["saveRetention"].tap()
+        XCTAssertTrue(app.staticTexts["Saved: delete after 7 days."].waitForExistence(timeout: 5))
+        let shot = XCTAttachment(screenshot: app.screenshot()); shot.name = "Retention Settings"; shot.lifetime = .keepAlways; add(shot)
+        app.navigationBars["Settings"].buttons["BackButton"].tap(); app.buttons["Settings"].tap()
+        XCTAssertEqual(days.value as? String, "7")
+        app.swipeUp()
+        XCTAssertTrue(app.staticTexts["Deletes local recordings, audio, transcripts and finished local upload copies. Uploaded workspace copies remain."].exists)
+    }
+}
