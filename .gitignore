@@ -1,0 +1,11 @@
+tmp/
+build/
+DerivedData/
+*.xcuserstate
+xcuserdata/
+.DS_Store
+
+build-signed/
+build-device/
+
+build-signed/
