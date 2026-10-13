@@ -172,9 +172,9 @@ final class IdentityModel: ObservableObject {
     @Published var notice: String?
     private let vault: IdentityVault?
     @Published private(set) var npub: String?
-    init() {
+    init(vault injectedVault: IdentityVault? = nil) {
         let root = try? FileManager.default.url(for: .applicationSupportDirectory, in: .userDomainMask, appropriateFor: nil, create: true)
-        vault = root.map { IdentityVault(url: $0.appendingPathComponent("Identity/vault.json")) }
+        vault = injectedVault ?? root.map { IdentityVault(url: $0.appendingPathComponent("Identity/vault.json")) }
         exists = vault?.exists == true
     }
     func perform(_ operation: (IdentityVault) throws -> Void) {

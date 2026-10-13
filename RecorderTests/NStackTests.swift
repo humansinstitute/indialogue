@@ -238,3 +238,140 @@ extension NStackTests {
         try await Task.sleep(for:.milliseconds(20)); XCTAssertEqual(requests,1)
     }
 }
+
+
+extension NStackTests {
+    func testStrictStorageByteCountsAndIntegrityErrors() throws {
+        for json in ["0", "101", "9223372036854775807", "\"0\"", "\"101\"", "\"9223372036854775807\""] {
+            let value = try JSONSerialization.jsonObject(with: Data(json.utf8), options: .fragmentsAllowed)
+            XCTAssertNoThrow(try StorageMetadata.byteCount(value), json)
+        }
+        for json in ["true", "false", "-1", "1.5", "1.01", "9223372036854775808", "null", "[]", "{}", "\"-1\"", "\"+1\"", "\"1.0\"", "\"1e2\"", "\" 101\"", "\"101 \"", "\"\"", "\"１２\"", "\"9223372036854775808\""] {
+            let value = try JSONSerialization.jsonObject(with: Data(json.utf8), options: .fragmentsAllowed)
+            XCTAssertThrowsError(try StorageMetadata.byteCount(value), json)
+        }
+        XCTAssertThrowsError(try StorageMetadata.byteCount(nil))
+        XCTAssertFalse(try StorageMetadata.isCompleted([:]))
+        XCTAssertFalse(try StorageMetadata.isCompleted(["completed_at":NSNull()]))
+        XCTAssertThrowsError(try StorageMetadata.isCompleted(["completed_at":42]))
+        XCTAssertThrowsError(try StorageMetadata.isCompleted(["completed_at":""]))
+        let file = TransferFile(name:"audio",mime:"audio/mp4",size:101,checksum:String(repeating:"a",count:64))
+        XCTAssertNoThrow(try StorageMetadata.validateCompleted(["completed_at":"done","size_bytes":"101","sha256_hex":file.checksum], file:file))
+        for (metadata, expected) in [
+            (["completed_at":"done","size_bytes":"bad","sha256_hex":file.checksum] as [String:Any], NStackError.storageMetadata),
+            (["completed_at":"done","size_bytes":101,"sha256_hex":"bad"], NStackError.storageMetadata),
+            (["completed_at":"done","size_bytes":102,"sha256_hex":file.checksum], NStackError.storageMismatch),
+            (["completed_at":"done","size_bytes":"101","sha256_hex":String(repeating:"b",count:64)], NStackError.storageMismatch),
+            (["size_bytes":"101","sha256_hex":file.checksum], NStackError.storageIncomplete)
+        ] {
+            XCTAssertThrowsError(try StorageMetadata.validateCompleted(metadata,file:file)) { error in
+                XCTAssertEqual(error.localizedDescription,expected.localizedDescription)
+            }
+        }
+    }
+
+    func testStringReadbackAndRestartFailedJobRetriesOriginalCompletedAudio() async throws {
+        let root = temp(); defer { try? FileManager.default.removeItem(at:root) }
+        let queue = NStackTransfers(root:root); let r = record(); let d = destination()
+        let audio = root.appendingPathComponent("source"); try Data([1,2,3]).write(to:audio)
+        try queue.enqueue(r,destination:d,audio:audio,corrected:"Original text")
+        let initial = queue.jobs[0]
+        var prepares = 0; var puts:[String:Int] = [:]; var objects:[String:(Int,String,Bool)] = [:]
+        var malformedOnce = true; var posted:[String:Any] = [:]
+        MockNStackProtocol.handler = { req in
+            let path = req.url!.path
+            var bytes = req.httpBody ?? Data()
+            if let stream = req.httpBodyStream {
+                stream.open(); defer { stream.close() }; var buffer = [UInt8](repeating:0,count:4096)
+                while stream.hasBytesAvailable { let n = stream.read(&buffer,maxLength:buffer.count); if n <= 0 { break }; bytes.append(contentsOf:buffer.prefix(n)) }
+            }
+            let body = (try? JSONSerialization.jsonObject(with:bytes)) as? [String:Any] ?? [:]
+            if path.hasSuffix("/prepare") {
+                prepares += 1; let id = UUID().uuidString
+                objects[id] = (body["size_bytes"] as! Int,body["sha256_hex"] as! String,false)
+                return (201,["object_id":id,"upload_url":"https://nstack.example/api/v4/storage/" + id])
+            }
+            if path.hasSuffix("/messages") { posted = body; return (201,["message":["id":UUID().uuidString]]) }
+            let id = path.split(separator:"/")[3].description
+            if req.httpMethod == "PUT" { puts[id,default:0] += 1; return (200,[:]) }
+            if path.hasSuffix("/complete") { objects[id]!.2 = true; return (200,[:]) }
+            let object = objects[id]!
+            var metadata:[String:Any] = ["size_bytes":String(object.0),"sha256_hex":object.1]
+            if object.2 {
+                metadata["completed_at"] = "2026-01-01"
+                if malformedOnce { malformedOnce = false; metadata["size_bytes"] = "invalid" }
+            }
+            return (200,metadata)
+        }
+        queue.setAvailability(active:true,signer:npub,api:api())
+        for _ in 0..<200 where queue.jobs[0].state != "failed" { try await Task.sleep(for:.milliseconds(10)) }
+        XCTAssertEqual(queue.jobs[0].state,"failed")
+        XCTAssertTrue(queue.jobs[0].notice?.contains("invalid size") == true)
+        let audioID = try XCTUnwrap(queue.jobs[0].files[0].objectID)
+        XCTAssertFalse(queue.jobs[0].files[0].complete)
+        XCTAssertEqual(prepares,1); XCTAssertEqual(puts[audioID],1)
+        let restored = NStackTransfers(root:root)
+        var changed = d; changed.channel = UUID().uuidString; changed.prompt = "Changed prompt"
+        try restored.save(changed)
+        restored.setAvailability(active:true,signer:npub,api:api())
+        XCTAssertEqual(restored.jobs[0].state,"failed") // unlock alone never silently retries a failure
+        restored.retry(initial.id)
+        for _ in 0..<200 where restored.jobs[0].state != "sent" { try await Task.sleep(for:.milliseconds(10)) }
+        XCTAssertEqual(restored.jobs[0].state,"sent")
+        XCTAssertEqual(prepares,2); XCTAssertEqual(puts[audioID],1)
+        XCTAssertEqual(restored.jobs[0].files[0].objectID,audioID)
+        XCTAssertTrue(restored.jobs[0].files.allSatisfy(\.complete))
+        XCTAssertEqual(restored.jobs[0].destination,d); XCTAssertEqual(restored.jobs[0].body,initial.body)
+        XCTAssertEqual(posted["client_request_id"] as? String,initial.id.uuidString)
+        XCTAssertEqual(posted["body"] as? String,initial.body)
+        XCTAssertTrue(FileManager.default.fileExists(atPath:audio.path))
+    }
+
+    func testUploadButtonRetriesExistingSnapshotWithoutExportOrRetarget() throws {
+        let root = temp(); let transferRoot = root.deletingLastPathComponent().appendingPathComponent(root.lastPathComponent + "-transfers")
+        defer { try? FileManager.default.removeItem(at:root); try? FileManager.default.removeItem(at:transferRoot) }
+        let model = RecorderModel(root:root,audioExport:{ _ in XCTFail("Retry must not export again"); throw NStackError.incomplete })
+        let audio = root.appendingPathComponent("audio"); try Data([1]).write(to:audio)
+        let r = record(); let d = destination()
+        try model.transfers.enqueue(r,destination:d,audio:audio,corrected:"Immutable")
+        var ledger = NStackTransfers.Ledger(jobs:model.transfers.jobs,intents:[],destination:nil)
+        ledger.jobs[0].state = "failed"; ledger.jobs[0].files[0].objectID = UUID().uuidString
+        try JSONEncoder().encode(ledger).write(to:transferRoot.appendingPathComponent("ledger.json"))
+        let restored = RecorderModel(root:root,audioExport:{ _ in XCTFail("Retry must not export again"); throw NStackError.incomplete })
+        restored.upload(r,destination:destination())
+        XCTAssertEqual(restored.transfers.jobs.count,1)
+        XCTAssertEqual(restored.transfers.jobs[0].id,ledger.jobs[0].id)
+        XCTAssertEqual(restored.transfers.jobs[0].files,ledger.jobs[0].files)
+        XCTAssertEqual(restored.transfers.jobs[0].destination,d)
+        XCTAssertEqual(restored.transfers.jobs[0].state,"paused_locked")
+        restored.background(); model.background()
+    }
+
+    func testForegroundUnlockPolicyDoesNotLoopOrRequireIdentity() {
+        var policy = ForegroundUnlockPolicy()
+        XCTAssertFalse(policy.request(active:false,exists:true,unlocked:false))
+        XCTAssertFalse(policy.request(active:true,exists:false,unlocked:false))
+        XCTAssertFalse(policy.request(active:true,exists:true,unlocked:true))
+        XCTAssertTrue(policy.request(active:true,exists:true,unlocked:false))
+        XCTAssertFalse(policy.request(active:true,exists:true,unlocked:false)) // dismiss/internal navigation
+        policy.background()
+        XCTAssertTrue(policy.request(active:true,exists:true,unlocked:false))
+    }
+}
+
+
+extension NStackTests {
+    func testLocalSnapshotMismatchStopsBeforeNetworkAndKeepsOriginal() async throws {
+        let root = temp(); defer { try? FileManager.default.removeItem(at:root) }
+        let queue = NStackTransfers(root:root); let audio = root.appendingPathComponent("source")
+        try Data([1,2,3]).write(to:audio)
+        try queue.enqueue(record(),destination:destination(),audio:audio,corrected:"text")
+        try Data([3,2,1]).write(to:root.appendingPathComponent(queue.jobs[0].id.uuidString).appendingPathComponent("recording.m4a"))
+        var calls = 0; MockNStackProtocol.handler = { _ in calls += 1; return (200,[:]) }
+        queue.setAvailability(active:true,signer:npub,api:api())
+        for _ in 0..<200 where queue.jobs[0].state != "failed" { try await Task.sleep(for:.milliseconds(10)) }
+        XCTAssertEqual(queue.jobs[0].state,"failed"); XCTAssertEqual(calls,0)
+        XCTAssertEqual(queue.jobs[0].notice,NStackError.snapshotMismatch.localizedDescription)
+        XCTAssertEqual(try Data(contentsOf:audio),Data([1,2,3]))
+    }
+}

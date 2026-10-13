@@ -386,6 +386,10 @@ final class RecorderModel: NSObject, ObservableObject, AVAudioRecorderDelegate, 
     var preparingUpload: Bool { snapshotTask != nil }
     func upload(_ r: Recording, destination: NStackDestination? = nil) {
         guard snapshotTask == nil, transcriptionTask == nil, active == nil, !suspended, !busy else { message = "Upload deferred while capture or local work is active."; return }
+        if let job = transfers.jobs.last(where: { $0.recordingID == r.id && $0.state != "cancelled" }) {
+            if job.state == "failed" || job.state.hasPrefix("paused_") { transfers.retry(job.id) }
+            return
+        }
         guard let d = destination ?? transfers.intents.first(where: { $0.recordingID == r.id })?.destination ?? transfers.destination else { message = "Configure NStack first."; return }
         snapshotTask = Task {
             busy = true

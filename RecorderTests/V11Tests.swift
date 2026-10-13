@@ -250,3 +250,24 @@ extension IdentityVaultTests {
         vault.lock(); XCTAssertThrowsError(try vault.signerNpub()); XCTAssertThrowsError(try vault.sign(kind:1,tags:[],content:""))
     }
 }
+
+
+extension IdentityVaultTests {
+    @MainActor func testInjectedIdentityModelReopensExistingVaultWithoutMigrationOrUnauthenticatedUnlock() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at:root) }
+        let secrets = MemorySecrets(); let url = root.appendingPathComponent("vault.json")
+        let original = IdentityVault(url:url,secrets:secrets)
+        try original.create(nsec:nsec([UInt8](repeating:0,count:31) + [1]),pin:"123456")
+        original.lock()
+        let bytes = try Data(contentsOf:url)
+        let model = IdentityModel(vault:IdentityVault(url:url,secrets:secrets))
+        XCTAssertTrue(model.exists); XCTAssertFalse(model.unlocked); XCTAssertNil(model.npub)
+        model.perform { try $0.unlock(pin:"999999") }
+        XCTAssertFalse(model.unlocked); XCTAssertNil(model.npub); XCTAssertNotNil(model.notice)
+        model.perform { try $0.unlock(pin:"123456") }
+        XCTAssertTrue(model.unlocked); XCTAssertNotNil(model.npub); XCTAssertNil(model.notice)
+        model.lock(); XCTAssertFalse(model.unlocked); XCTAssertNil(model.npub)
+        XCTAssertEqual(try Data(contentsOf:url),bytes)
+    }
+}

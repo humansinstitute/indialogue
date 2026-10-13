@@ -18,16 +18,29 @@ struct PeteRecorderApp: App {
         #endif
         _model = StateObject(wrappedValue: RecorderModel())
     }
-    var body: some Scene { WindowGroup { RecorderView(model: model) } }
+    var body: some Scene { WindowGroup {
+        #if DEBUG && targetEnvironment(simulator)
+        if ProcessInfo.processInfo.arguments.contains("--synthetic-unlock") {
+            RecorderView(model: model, identity: SyntheticUnlockIdentity.make())
+        } else { RecorderView(model: model) }
+        #else
+        RecorderView(model: model)
+        #endif
+    } }
 }
 
 struct ShareFile: Identifiable { let id = UUID(); let url: URL }
 struct RecorderView: View {
     @ObservedObject var model: RecorderModel
     @ObservedObject var transfers: NStackTransfers
-    init(model: RecorderModel) { self.model = model; self.transfers = model.transfers }
+    init(model: RecorderModel, identity: IdentityModel? = nil) {
+        self.model = model; self.transfers = model.transfers
+        _identity = StateObject(wrappedValue: identity ?? IdentityModel())
+    }
     @Environment(\.scenePhase) private var scenePhase
-    @StateObject private var identity = IdentityModel()
+    @StateObject private var identity: IdentityModel
+    @State private var unlockOpen = false
+    @State private var unlockPolicy = ForegroundUnlockPolicy()
     @State private var menuOpen = false
     @State private var pendingRecording: Recording?
     @State private var micOpen = false
@@ -70,19 +83,21 @@ struct RecorderView: View {
                     }
                 }
                 .sheet(isPresented: $menuOpen, onDismiss: {
-                    if let pendingRecording { selected = pendingRecording; self.pendingRecording = nil }
+                    if let pendingRecording, !(identity.exists && !identity.unlocked && !unlockPolicy.requested) { selected = pendingRecording }
+                    self.pendingRecording = nil
+                    requestUnlock()
                 }) { menu }
-                .sheet(isPresented: $micOpen) { microphones }
+                .sheet(isPresented: $micOpen, onDismiss: { requestUnlock() }) { microphones }
                 .onChange(of: scenePhase) { _, phase in
-                    if phase == .active { model.foreground() }
-                    else if phase == .background { identity.lock(); model.background() }
+                    if phase == .active { model.foreground(); requestUnlock() }
+                    else if phase == .background { unlockOpen = false; unlockPolicy.background(); identity.lock(); model.background() }
                 }
                 .onChange(of: model.message) { _, value in if value != nil { criticalNotice = true } }
                 .alert("Recorder notice", isPresented: $criticalNotice) {
                     Button("OK", role: .cancel) {}
                 } message: { Text(model.message ?? "See Notices in the menu.") }
-                .sheet(item: $selected) { r in details(r) }
-                .sheet(item: $share) { ShareSheet(url: $0.url) }
+                .sheet(item: $selected, onDismiss: { requestUnlock() }) { r in details(r) }
+                .sheet(item: $share, onDismiss: { requestUnlock() }) { ShareSheet(url: $0.url) }
                 .alert("Rename recording", isPresented: Binding(get: { renameTarget != nil }, set: { if !$0 { renameTarget = nil } })) {
                     TextField("Recording name", text: $renameText)
                     Button("Save") { if let r = renameTarget { model.rename(r, title: renameText) }; renameTarget = nil }
@@ -98,7 +113,19 @@ struct RecorderView: View {
         }.onChange(of:identity.npub) { _,_ in refreshTransfers() }
         .onChange(of:model.active) { _,_ in refreshTransfers() }
         .onChange(of:scenePhase) { _,_ in refreshTransfers() }
-        .onAppear { refreshTransfers() }
+        .onAppear { refreshTransfers(); requestUnlock() }
+        .fullScreenCover(isPresented: $unlockOpen, onDismiss: { refreshTransfers() }) {
+            IdentityUnlock(model: identity) { unlockOpen = false; refreshTransfers() }
+        }
+    }
+    func requestUnlock() {
+        guard scenePhase == .active, identity.exists, !identity.unlocked, !unlockPolicy.requested else { return }
+        // Let an existing sheet finish dismissing before presenting authentication.
+        if menuOpen { menuOpen = false; return }
+        if micOpen { micOpen = false; return }
+        if selected != nil { selected = nil; return }
+        if share != nil { share = nil; return }
+        if unlockPolicy.request(active: scenePhase == .active, exists: identity.exists, unlocked: identity.unlocked) { unlockOpen = true }
     }
     func refreshTransfers() {
         transfers.setAvailability(active:scenePhase == .active && model.active == nil, signer:identity.npub, api:NStackAPI { try identity.sign(kind:$0,tags:$1,content:$2) })
@@ -178,7 +205,7 @@ struct RecorderView: View {
                 }
                 Section("NStack delivery") {
                     if let status = transfers.status(r.id) { Text(status) }
-                    Button("Upload corrected transcript and audio") { model.upload(r) }.disabled(model.busy || model.active != nil || r.transcriptionState != .complete)
+                    Button(transfers.jobs.last(where: { $0.recordingID == r.id && $0.state != "cancelled" })?.state == "failed" ? "Retry upload · same snapshot" : "Upload corrected transcript and audio") { model.upload(r) }.disabled(model.busy || model.active != nil || r.transcriptionState != .complete)
                     Text("Uses current reviewed text with saved vocabulary. Unaccepted cleanup drafts are excluded.").font(.footnote)
                 }
                 Section("Local transcription") {
@@ -204,3 +231,21 @@ struct ShareSheet: UIViewControllerRepresentable {
     func makeUIViewController(context: Context) -> UIActivityViewController { UIActivityViewController(activityItems: [url], applicationActivities: nil) }
     func updateUIViewController(_ controller: UIActivityViewController, context: Context) {}
 }
+
+#if DEBUG && targetEnvironment(simulator)
+private final class SyntheticUnlockSecrets: VaultSecretStore {
+    var value: Data?
+    func read() throws -> Data? { value }
+    func write(_ data: Data) throws { value = data }
+}
+private enum SyntheticUnlockIdentity {
+    @MainActor static func make() -> IdentityModel {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("SyntheticUnlock-" + UUID().uuidString)
+        let vault = IdentityVault(url:root.appendingPathComponent("vault.json"),secrets:SyntheticUnlockSecrets())
+        // Public synthetic scalar one; never a real identity or Keychain secret.
+        try? vault.create(nsec:"nsec1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqsmhltgl",pin:"123456")
+        vault.lock()
+        return IdentityModel(vault:vault)
+    }
+}
+#endif

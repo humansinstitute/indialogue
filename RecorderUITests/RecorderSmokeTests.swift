@@ -2,7 +2,7 @@ import XCTest
 final class RecorderSmokeTests: XCTestCase {
     func testMinimalHomeAndMenuNavigationWithoutCapture() {
         let app = XCUIApplication(); app.launch()
-        XCTAssertTrue(app.navigationBars["Pete Recorder"].waitForExistence(timeout: 10))
+        XCTAssertTrue(app.navigationBars["In Dialogue"].waitForExistence(timeout: 10))
         XCTAssertTrue(app.buttons["recordButton"].exists)
         XCTAssertTrue(app.buttons["microphoneControl"].exists)
         XCTAssertFalse(app.buttons["Find available microphones"].exists)
@@ -64,5 +64,36 @@ extension RecorderSmokeTests {
         XCTAssertTrue(app.navigationBars["NStack uploads"].waitForExistence(timeout:5))
         XCTAssertTrue(app.staticTexts["No uploads yet. Configure NStack or use Upload on a saved recording."].exists)
         let history = XCTAttachment(screenshot:app.screenshot()); history.name = "NStack upload history"; history.lifetime = .keepAlways; add(history)
+    }
+}
+
+
+extension RecorderSmokeTests {
+    func testSyntheticForegroundUnlockDismissRetryAndBackgroundLock() {
+        let app = XCUIApplication(); app.launchArguments = ["--synthetic-review", "--synthetic-unlock"]; app.launch()
+        let unlock = app.buttons["identityUnlockButton"]
+        XCTAssertTrue(unlock.waitForExistence(timeout:10))
+        XCTAssertTrue(app.secureTextFields["identityUnlockPIN"].exists)
+        XCTAssertFalse(app.secureTextFields["Paste nsec"].exists)
+        let locked = XCTAttachment(screenshot:app.screenshot()); locked.name = "Focused foreground identity unlock"; locked.lifetime = .keepAlways; add(locked)
+        app.buttons["Continue locked"].tap()
+        XCTAssertTrue(app.buttons["recordButton"].waitForExistence(timeout:5))
+        app.buttons["menuButton"].tap(); app.buttons["Vocabulary"].tap()
+        XCTAssertFalse(unlock.exists)
+        XCUIDevice.shared.press(.home); app.activate()
+        XCTAssertTrue(unlock.waitForExistence(timeout:10))
+        let pin = app.secureTextFields["identityUnlockPIN"]; pin.tap(); pin.typeText("999999"); unlock.tap()
+        XCTAssertTrue(app.staticTexts["Incorrect PIN or damaged identity vault. Existing identity has been retained."].waitForExistence(timeout:5))
+        pin.tap(); pin.typeText("123456"); unlock.tap()
+        XCTAssertFalse(unlock.waitForExistence(timeout:2))
+        XCTAssertTrue(app.buttons["menuButton"].waitForExistence(timeout:5))
+        app.buttons["menuButton"].tap(); app.buttons["Identity"].tap()
+        XCTAssertTrue(app.staticTexts["Imported identity · unlocked"].waitForExistence(timeout:5))
+        let opened = XCTAttachment(screenshot:app.screenshot()); opened.name = "Synthetic identity authenticated"; opened.lifetime = .keepAlways; add(opened)
+        app.navigationBars.buttons.element(boundBy:0).tap(); app.buttons["Vocabulary"].tap()
+        app.navigationBars.buttons.element(boundBy:0).tap(); app.buttons["Identity"].tap()
+        XCTAssertTrue(app.staticTexts["Imported identity · unlocked"].exists)
+        XCUIDevice.shared.press(.home); app.activate()
+        XCTAssertTrue(unlock.waitForExistence(timeout:10))
     }
 }

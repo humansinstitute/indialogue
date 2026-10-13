@@ -1,6 +1,35 @@
 import Foundation
 import CryptoKit
 import SwiftUI
+import CoreFoundation
+
+/// Storage APIs serialize bigint byte counts as either JSON integers or decimal strings.
+enum StorageMetadata {
+    static func byteCount(_ value: Any?) throws -> Int {
+        let digits: String
+        if let string = value as? String { digits = string }
+        else if let number = value as? NSNumber {
+            guard CFGetTypeID(number) != CFBooleanGetTypeID(),
+                  !["f", "d"].contains(String(cString: number.objCType)) else { throw NStackError.storageMetadata }
+            digits = number.stringValue
+        } else { throw NStackError.storageMetadata }
+        guard !digits.isEmpty, digits.utf8.allSatisfy({ $0 >= 48 && $0 <= 57 }),
+              let count = Int(digits) else { throw NStackError.storageMetadata }
+        return count
+    }
+    static func isCompleted(_ metadata: [String:Any]) throws -> Bool {
+        guard let value = metadata["completed_at"], !(value is NSNull) else { return false }
+        guard let completed = value as? String, !completed.isEmpty else { throw NStackError.storageMetadata }
+        return true
+    }
+    static func validateCompleted(_ metadata: [String:Any], file: TransferFile) throws {
+        guard try isCompleted(metadata) else { throw NStackError.storageIncomplete }
+        let size = try byteCount(metadata["size_bytes"])
+        guard let checksum = metadata["sha256_hex"] as? String, checksum.utf8.count == 64,
+              checksum.utf8.allSatisfy({ (48...57).contains($0) || (97...102).contains($0) || (65...70).contains($0) }) else { throw NStackError.storageMetadata }
+        guard size == file.size, checksum.lowercased() == file.checksum.lowercased() else { throw NStackError.storageMismatch }
+    }
+}
 
 struct TransferFile: Codable, Equatable {
     var name: String
@@ -151,7 +180,7 @@ final class NStackTransfers: ObservableObject {
             if jobs[i].files[f].complete { continue }
             let file = jobs[i].files[f]; let path = root.appendingPathComponent(jobs[i].id.uuidString).appendingPathComponent(file.name)
             let actual = try Self.checksum(path)
-            guard actual.0 == file.size, actual.1 == file.checksum else { throw NStackError.incomplete }
+            guard actual.0 == file.size, actual.1 == file.checksum else { throw NStackError.snapshotMismatch }
             if file.objectID == nil {
                 guard !file.preparing else { throw NStackError.prepareUncertain }
                 jobs[i].files[f].preparing = true; try persist()
@@ -161,13 +190,13 @@ final class NStackTransfers: ObservableObject {
             }
             let object = jobs[i].files[f].objectID!
             let metadata = try await api.request(origin:d.origin,path:"/api/v4/storage/\(object)")
-            if metadata["completed_at"] is String {
-                guard (metadata["size_bytes"] as? Int) == file.size, metadata["sha256_hex"] as? String == file.checksum else { throw NStackError.incomplete }
+            if try StorageMetadata.isCompleted(metadata) {
+                try StorageMetadata.validateCompleted(metadata, file: file)
             } else {
                 try await api.putFile(path,upload:jobs[i].files[f].uploadURL!,origin:d.origin,object:object,mime:file.mime,size:file.size)
                 _ = try await api.request(origin:d.origin,path:"/api/v4/storage/\(object)/complete",method:"POST",body:["size_bytes":file.size,"sha256_hex":file.checksum])
                 let readback = try await api.request(origin:d.origin,path:"/api/v4/storage/\(object)")
-                guard readback["completed_at"] is String, readback["sha256_hex"] as? String == file.checksum, readback["size_bytes"] as? Int == file.size else { throw NStackError.incomplete }
+                try StorageMetadata.validateCompleted(readback, file: file)
             }
             jobs[i].files[f].complete = true; try persist()
         }

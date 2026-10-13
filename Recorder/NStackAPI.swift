@@ -23,6 +23,7 @@ struct NStackDestination: Codable, Equatable {
 }
 enum NStackError: LocalizedError {
     case invalidSetup, unsafeURL, response(Int), malformed, incomplete, fallbackLimit, prepareUncertain
+    case snapshotMismatch, storageMetadata, storageMismatch, storageIncomplete
     var errorDescription: String? {
         switch self {
         case .invalidSetup: "Choose an HTTPS NStack, workspace, channel, unlocked identity and meaningful prompt. Check the recipient npub and label."
@@ -30,6 +31,10 @@ enum NStackError: LocalizedError {
         case .response(let code): "NStack returned HTTP \(code). Check access and connection; local files retained."
         case .malformed: "NStack returned an unexpected response. Local files retained."
         case .incomplete: "Recording or export is incomplete. Review recording history; upload refused and audio retained."
+        case .snapshotMismatch: "Local upload snapshot no longer matches its saved size or checksum. Upload refused; original audio retained."
+        case .storageMetadata: "NStack storage returned invalid size or checksum metadata. Retry the same snapshot after the server response is corrected; local files retained."
+        case .storageMismatch: "Stored upload size or checksum does not match the snapshot. Delivery refused; retry keeps the original objects and local files."
+        case .storageIncomplete: "NStack has not confirmed storage completion. Retry the same snapshot; local files retained."
         case .fallbackLimit: "This backend uses JSON audio upload, limited to 8 MiB. Configure presigned storage for longer audio. Files retained."
         case .prepareUncertain: "Storage prepare response was uncertain. Retry cannot safely allocate another object. Cancel this snapshot and review remote storage before creating a new upload."
         }

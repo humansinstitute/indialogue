@@ -37,7 +37,7 @@ struct IdentitySettings: View {
                 Button("Remove identity", role: .destructive) { model.perform { try $0.remove() }; clear() }
             }
             .alert("PINs do not match", isPresented: $mismatch) { Button("OK", role: .cancel) {} }
-            .onChange(of: scenePhase) { _, phase in if phase != .active { clear(); model.lock() } }
+            .onChange(of: scenePhase) { _, phase in if phase != .active { clear() }; if phase == .background { model.lock() } }
             .onDisappear { clear() }
     }
 }
@@ -175,5 +175,44 @@ struct WordReview: UIViewRepresentable {
             let range = textItem.range
             return UIAction { [weak self] _ in self?.parent.tapped(range) }
         }
+    }
+}
+
+/// Once dismissed, remain quiet until a real background/foreground cycle.
+struct ForegroundUnlockPolicy {
+    private(set) var requested = false
+    mutating func background() { requested = false }
+    mutating func request(active: Bool, exists: Bool, unlocked: Bool) -> Bool {
+        guard active, exists, !unlocked, !requested else { return false }
+        requested = true
+        return true
+    }
+}
+
+struct IdentityUnlock: View {
+    @ObservedObject var model: IdentityModel
+    let done: () -> Void
+    @Environment(\.scenePhase) private var scenePhase
+    @State private var pin = ""
+    @FocusState private var pinFocused: Bool
+    var body: some View {
+        NavigationStack {
+            Form {
+                Section {
+                    Text("Unlock your imported identity to resume eligible NStack uploads. You can continue recording while locked.")
+                    SecureField("PIN", text: $pin).keyboardType(.numberPad)
+                        .focused($pinFocused).accessibilityIdentifier("identityUnlockPIN")
+                    Button("Unlock identity") {
+                        model.perform { try $0.unlock(pin: pin) }
+                        pin = ""
+                        if model.unlocked { done() }
+                    }.disabled(pin.isEmpty).accessibilityIdentifier("identityUnlockButton")
+                    if let notice = model.notice { Text(notice) }
+                }
+            }.navigationTitle("Unlock identity")
+                .toolbar { ToolbarItem(placement: .cancellationAction) { Button("Continue locked") { pin = ""; done() } } }
+        }.onAppear { pinFocused = true }
+            .onDisappear { pin = "" }
+            .onChange(of: scenePhase) { _, phase in if phase != .active { pin = "" } }
     }
 }
