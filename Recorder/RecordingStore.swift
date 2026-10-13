@@ -2,7 +2,7 @@ import Foundation
 import AVFoundation
 
 struct Recording: Codable, Identifiable, Equatable {
-    var schemaVersion = 1
+    var schemaVersion = 2
     var id = UUID()
     var title: String
     var createdAt = Date()
@@ -12,6 +12,34 @@ struct Recording: Codable, Identifiable, Equatable {
     var events: [String] = []
     var transcript: String?
     var transcriptionLocale: String?
+    var correctedTranscript: String?
+    var cleanupDraft: String?
+    var transcriptionState: TranscriptionState = .none
+    var transcriptionNotice: String?
+    enum TranscriptionState: String, Codable { case none, queued, running, complete, failed, cancelled }
+    var reviewText: String { correctedTranscript ?? transcript ?? "" }
+    enum CodingKeys: String, CodingKey {
+        case schemaVersion, id, title, createdAt, state, segments, duration, events, transcript, transcriptionLocale
+        case correctedTranscript, cleanupDraft, transcriptionState, transcriptionNotice
+    }
+    init(title: String) { self.title = title }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        schemaVersion = max(2, try c.decodeIfPresent(Int.self, forKey: .schemaVersion) ?? 1)
+        id = try c.decode(UUID.self, forKey: .id)
+        title = try c.decode(String.self, forKey: .title)
+        createdAt = try c.decodeIfPresent(Date.self, forKey: .createdAt) ?? Date()
+        state = try c.decodeIfPresent(State.self, forKey: .state) ?? .saved
+        segments = try c.decodeIfPresent([String].self, forKey: .segments) ?? []
+        duration = try c.decodeIfPresent(Double.self, forKey: .duration) ?? 0
+        events = try c.decodeIfPresent([String].self, forKey: .events) ?? []
+        transcript = try c.decodeIfPresent(String.self, forKey: .transcript)
+        transcriptionLocale = try c.decodeIfPresent(String.self, forKey: .transcriptionLocale)
+        correctedTranscript = try c.decodeIfPresent(String.self, forKey: .correctedTranscript)
+        cleanupDraft = try c.decodeIfPresent(String.self, forKey: .cleanupDraft)
+        transcriptionState = try c.decodeIfPresent(TranscriptionState.self, forKey: .transcriptionState) ?? (transcript == nil ? .none : .complete)
+        transcriptionNotice = try c.decodeIfPresent(String.self, forKey: .transcriptionNotice)
+    }
     enum State: String, Codable { case recording, saved, interrupted }
 }
 
@@ -67,6 +95,11 @@ final class RecordingStore {
             records[i].events.append("Recovered after app termination. Last segment may be incomplete; earlier segments retained.")
             do { try save(records[i]) }
             catch { warnings.append("Recovered recording \(records[i].id.uuidString), but could not save recovery metadata: \(error.localizedDescription). Original files retained.") }
+        }
+        for i in records.indices where records[i].transcriptionState == .running {
+            records[i].transcriptionState = .queued
+            records[i].transcriptionNotice = "Queued after interruption; audio retained."
+            do { try save(records[i]) } catch { warnings.append("Could not save transcription recovery: \(error.localizedDescription)") }
         }
         return records
     }

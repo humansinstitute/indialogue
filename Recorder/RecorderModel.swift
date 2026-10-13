@@ -6,6 +6,30 @@ import UIKit
 final class RecorderModel: NSObject, ObservableObject, AVAudioRecorderDelegate, AVAudioPlayerDelegate {
     @Published var recordings: [Recording] = []
     @Published var active: Recording?
+    @Published var vocabulary: [VocabularyCorrection] = []
+    @Published var selectedInputName: String = UserDefaults.standard.string(forKey: "preferredInputName") ?? "System default"
+    @Published var preferredInputAvailable: Bool?
+    var microphonePreferenceLabel: String { Self.preferenceLabel(name: selectedInputName, available: preferredInputAvailable) }
+    static func preferenceLabel(name: String, available: Bool?) -> String {
+        if name == "System default" { return name }
+        switch available {
+        case true: return name + " · preference"
+        case false: return name + " unavailable · System default"
+        case nil: return name + " · preference (availability unchecked)"
+        }
+    }
+    private var selectedInputUID: String? = UserDefaults.standard.string(forKey: "preferredInputUID")
+    private var vocabularyStore: VocabularyStore?
+    private var vocabularyReadable = true
+    private var suspended = false
+    private var deferredTranscription = false
+    private var downloadRequests: Set<UUID> = []
+    private var transcriptionID: UUID?
+    private let speech: ([URL], Bool) async throws -> LocalTranscript
+    private let audioExport: ((Recording) async throws -> URL)?
+    @Published var cleanupStatus: String?
+    @Published var cleaning = false
+    private var cleanupTask: Task<Void, Never>?
     @Published var actualInput = "Microphone inactive"
     @Published var inputs: [AVAudioSessionPortDescription] = []
     @Published var message: String?
@@ -24,7 +48,10 @@ final class RecorderModel: NSObject, ObservableObject, AVAudioRecorderDelegate, 
     private var observers: [NSObjectProtocol] = []
     private let session = AVAudioSession.sharedInstance()
 
-    init(root requestedRoot: URL? = nil) {
+    init(root requestedRoot: URL? = nil,
+         speech: @escaping ([URL], Bool) async throws -> LocalTranscript = { try await LocalSpeech.transcribe($0, download: $1) },
+         audioExport: ((Recording) async throws -> URL)? = nil) {
+        self.speech = speech; self.audioExport = audioExport
         var loaded: [Recording] = []
         var failure: String?
         var candidate: RecordingStore?
@@ -38,15 +65,26 @@ final class RecorderModel: NSObject, ObservableObject, AVAudioRecorderDelegate, 
         store = candidate
         super.init()
         recordings = loaded; message = failure
+        if let candidate {
+            vocabularyStore = VocabularyStore(url: candidate.root.appendingPathComponent("vocabulary.json"))
+            do { vocabulary = try vocabularyStore!.load() }
+            catch { vocabularyReadable = false; message = "Vocabulary unreadable; original file retained. \(error.localizedDescription)" }
+        }
         for name in [AVAudioSession.interruptionNotification, AVAudioSession.routeChangeNotification, AVAudioSession.mediaServicesWereResetNotification] {
             observers.append(NotificationCenter.default.addObserver(forName: name, object: nil, queue: .main) { [weak self] note in
                 Task { @MainActor in self?.notification(note) }
             })
         }
-        Task { speechStatus = await LocalSpeech.status() }
+        Task { speechStatus = await LocalSpeech.status(); resumeTranscriptionQueue() }
     }
     func refreshRoute() {
-        inputs = session.availableInputs ?? []
+        let availableInputs = session.availableInputs
+        inputs = availableInputs ?? []
+        if let uid = selectedInputUID {
+            if let availableInputs { preferredInputAvailable = availableInputs.contains { $0.uid == uid } }
+            else if active != nil { preferredInputAvailable = session.currentRoute.inputs.contains { $0.uid == uid } }
+            // Deactivation may hide availableInputs; retain the last known availability.
+        } else { preferredInputAvailable = nil }
         actualInput = session.currentRoute.inputs.map { port in
             port.portName + (port.selectedDataSource.map { " · " + $0.dataSourceName } ?? "")
         }.joined(separator: ", ")
@@ -67,23 +105,39 @@ final class RecorderModel: NSObject, ObservableObject, AVAudioRecorderDelegate, 
     func selectInput(_ input: AVAudioSessionPortDescription) {
         do {
             try session.setPreferredInput(input)
+            selectedInputUID = input.uid; selectedInputName = input.portName
+            UserDefaults.standard.set(input.uid, forKey: "preferredInputUID")
+            UserDefaults.standard.set(input.portName, forKey: "preferredInputName")
             refreshRoute()
             if var r = active { r.events.append("Input preference: \(input.portName); actual: \(actualInput)"); try persist(r); active = r }
         } catch { report(error); if active != nil { stop(interrupted: true) } }
     }
+    func selectSystemInput() {
+        do {
+            try session.setPreferredInput(nil)
+            selectedInputUID = nil; selectedInputName = "System default"
+            UserDefaults.standard.removeObject(forKey: "preferredInputUID")
+            UserDefaults.standard.removeObject(forKey: "preferredInputName")
+            refreshRoute()
+        } catch { report(error) }
+    }
     func start() async {
         guard active == nil, !busy, let store else { return }
+        prioritizeCapture()
         message = nil
-        busy = true; defer { busy = false }
+        busy = true; defer { busy = false; if active == nil { resumeTranscriptionQueue() } }
         let allowed = await AVAudioApplication.requestRecordPermission()
         guard allowed else { message = "Microphone access denied. Enable it in Settings → Privacy & Security → Microphone → Pete Recorder."; return }
         stopPlayback()
         do {
             try session.setCategory(.playAndRecord, mode: .default, options: [.defaultToSpeaker, .allowBluetoothHFP])
             try session.setActive(true)
+            let requestedInput = selectedInputUID.flatMap { uid in session.availableInputs?.first { $0.uid == uid } }
+            try session.setPreferredInput(requestedInput) // A vanished preference must not masquerade as an actual route.
             refreshRoute()
             var r = Recording(title: Date.now.formatted(date: .abbreviated, time: .shortened))
             r.events.append("Started with \(actualInput)")
+            if preferredInputAvailable == false { r.events.append("Preferred microphone unavailable: \(selectedInputName). Actual route: \(actualInput)") }
             try store.save(r) // Intent is durable before the microphone starts.
             active = r; elapsed = 0
             try beginSegment()
@@ -131,6 +185,7 @@ final class RecorderModel: NSObject, ObservableObject, AVAudioRecorderDelegate, 
         do { try closeSegment() } catch { report(error) }
         if var r = active {
             r.state = interrupted ? .interrupted : .saved
+            if !interrupted { r.transcriptionState = .queued; r.transcriptionNotice = "Queued for transcription using installed speech model." }
             if interrupted { r.events.append("Capture stopped unexpectedly; inspect saved audio before resuming a new recording.") }
             do { try persist(r) } catch { report(error) }
             recordings.removeAll { $0.id == r.id }; recordings.insert(r, at: 0)
@@ -138,10 +193,17 @@ final class RecorderModel: NSObject, ObservableObject, AVAudioRecorderDelegate, 
         active = nil; elapsed = 0
         try? session.setActive(false, options: .notifyOthersOnDeactivation)
         refreshRoute()
+        resumeTranscriptionQueue()
     }
     private func notification(_ note: Notification) {
         if note.name == AVAudioSession.routeChangeNotification {
             refreshRoute()
+            if let uid = selectedInputUID,
+               (note.userInfo?[AVAudioSessionRouteChangeReasonKey] as? UInt) == AVAudioSession.RouteChangeReason.oldDeviceUnavailable.rawValue,
+               let previous = note.userInfo?[AVAudioSessionRouteChangePreviousRouteKey] as? AVAudioSessionRouteDescription,
+               previous.inputs.contains(where: { $0.uid == uid }), !session.currentRoute.inputs.contains(where: { $0.uid == uid }) {
+                preferredInputAvailable = false
+            }
             if var r = active {
                 r.events.append("Route changed: \(actualInput)")
                 do { try persist(r); active = r } catch { report(error); stop(interrupted: true); return }
@@ -173,11 +235,13 @@ final class RecorderModel: NSObject, ObservableObject, AVAudioRecorderDelegate, 
     func rename(_ r: Recording, title: String) {
         let name = title.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !name.isEmpty, !busy else { return }
-        var edited = r; edited.title = name
+        var edited = recordings.first(where: { $0.id == r.id }) ?? r; edited.title = name
         do { try persist(edited); replace(edited) } catch { report(error) }
     }
     func delete(_ r: Recording) {
         guard !busy else { return }
+        if transcriptionID == r.id { cancelTranscription() }
+        cancelCleanup()
         if playing == r.id { stopPlayback() }
         do { try store?.delete(r); recordings.removeAll { $0.id == r.id } } catch { report(error) }
     }
@@ -234,32 +298,110 @@ final class RecorderModel: NSObject, ObservableObject, AVAudioRecorderDelegate, 
         }
         guard time > .zero else { throw RecorderError.capture }
         if !skipped.isEmpty { message = "Shared playable audio only. Unreadable segments omitted: \(skipped.joined(separator: ", ")). Original files retained." }
-        let output = FileManager.default.temporaryDirectory.appendingPathComponent(r.id.uuidString + ".m4a")
+        let output = FileManager.default.temporaryDirectory.appendingPathComponent(r.id.uuidString + "-" + UUID().uuidString + ".m4a")
         try? FileManager.default.removeItem(at: output)
         guard let exporter = AVAssetExportSession(asset: composition, presetName: AVAssetExportPresetAppleM4A) else { throw RecorderError.capture }
         try await exporter.export(to: output, as: .m4a)
         return output
     }
     func startTranscription(_ r: Recording, download: Bool) {
-        guard !busy, active == nil, transcriptionTask == nil else { return }
+        guard active == nil, !busy, let current = recordings.first(where: { $0.id == r.id }) else { return }
+        if download { downloadRequests.insert(r.id) }
+        updateTranscription(current.id, state: .queued, notice: "Queued for local transcription.")
+        resumeTranscriptionQueue()
+    }
+    func updateTranscription(_ id: UUID, state: Recording.TranscriptionState, notice: String?) {
+        guard var r = recordings.first(where: { $0.id == id }) else { return }
+        r.transcriptionState = state; r.transcriptionNotice = notice
+        do { try persist(r); replace(r) } catch { report(error) }
+    }
+    func resumeTranscriptionQueue() {
+        guard !suspended, active == nil, !busy, transcriptionTask == nil,
+              let r = recordings.reversed().first(where: { $0.transcriptionState == .queued }) else { return }
+        deferredTranscription = false; transcriptionID = r.id
+        let download = downloadRequests.remove(r.id) != nil
         transcriptionTask = Task { await transcribe(r, download: download) }
     }
-    func cancelTranscription() { transcriptionTask?.cancel() }
+    func cancelTranscription() {
+        deferredTranscription = false
+        if let id = transcriptionID { updateTranscription(id, state: .cancelled, notice: "Transcription cancelled. Audio retained; retry from this recording.") }
+        transcriptionTask?.cancel()
+    }
+    func prioritizeCapture() { deferTranscription(); cancelCleanup() }
+    func deferTranscription() {
+        if let id = transcriptionID {
+            deferredTranscription = true
+            updateTranscription(id, state: .queued, notice: "Transcription deferred for capture or app suspension. Audio retained.")
+            transcriptionTask?.cancel()
+        }
+    }
+    func background() { suspended = true; deferTranscription(); cancelCleanup() }
+    func foreground() { suspended = false; refreshRoute(); resumeTranscriptionQueue() }
     private func transcribe(_ r: Recording, download: Bool) async {
-        guard !busy, active == nil else { return }
-        busy = true; transcribing = true
-        defer { busy = false; transcribing = false; transcriptionTask = nil }
+        transcribing = true
+        defer {
+            transcribing = false; transcriptionID = nil; transcriptionTask = nil
+            resumeTranscriptionQueue()
+        }
         do {
-            // Analyze one continuous file so speech has a single timeline and context
-            // across capture segments. Export retains and reports unreadable sources.
-            let audio = try await export(r)
+            try Task.checkCancellation()
+            guard active == nil, !suspended else { throw CancellationError() }
+            updateTranscription(r.id, state: .running, notice: "Transcribing on device…")
+            let audio: URL
+            if let audioExport { audio = try await audioExport(r) }
+            else { audio = try await export(r) }
             defer { try? FileManager.default.removeItem(at: audio) }
             try Task.checkCancellation()
-            let text = try await LocalSpeech.transcribe([audio], download: download)
-            var edited = r; edited.transcript = text.text; edited.transcriptionLocale = text.locale
-            try persist(edited); replace(edited); speechStatus = await LocalSpeech.status()
-        } catch is CancellationError { message = "Transcription cancelled. Saved audio retained." }
-        catch { report(error) }
+            let text = try await speech([audio], download)
+            try Task.checkCancellation()
+            guard var edited = recordings.first(where: { $0.id == r.id }) else { return }
+            // Keep edits/drafts if the user retries speech recognition.
+            edited.transcript = text.text; edited.transcriptionLocale = text.locale
+            if edited.correctedTranscript == nil { edited.correctedTranscript = TranscriptCorrections.apply(text.text, vocabulary: vocabulary) }
+            edited.transcriptionState = .complete; edited.transcriptionNotice = "Transcription complete."
+            try persist(edited); replace(edited)
+        } catch is CancellationError {
+            if deferredTranscription { updateTranscription(r.id, state: .queued, notice: "Deferred; will retry when app is active and capture is idle.") }
+        } catch {
+            if Task.isCancelled {
+                if deferredTranscription { updateTranscription(r.id, state: .queued, notice: "Deferred; audio retained.") }
+            } else { updateTranscription(r.id, state: .failed, notice: error.localizedDescription) }
+        }
+    }
+    func saveVocabulary(_ rules: [VocabularyCorrection]) {
+        guard vocabularyReadable else { message = "Vocabulary file unreadable. File retained; cannot overwrite it."; return }
+        do { try vocabularyStore?.save(rules); vocabulary = rules } catch { report(error) }
+    }
+    func editTranscript(_ id: UUID, text: String) {
+        guard var r = recordings.first(where: { $0.id == id }) else { return }
+        r.correctedTranscript = text; r.cleanupDraft = nil
+        do { try persist(r); replace(r) } catch { report(error) }
+    }
+    func applyVocabulary(_ id: UUID) {
+        guard let r = recordings.first(where: { $0.id == id }) else { return }
+        editTranscript(id, text: TranscriptCorrections.apply(r.reviewText, vocabulary: vocabulary))
+    }
+    func cleanUp(_ id: UUID) {
+        guard cleanupTask == nil, active == nil, let r = recordings.first(where: { $0.id == id }), !r.reviewText.isEmpty else { return }
+        cleaning = true; cleanupStatus = "Cleaning up on device…"
+        let source = r.reviewText; let rules = vocabulary
+        cleanupTask = Task {
+            defer { cleanupTask = nil; cleaning = false }
+            do {
+                let draft = try await LocalCleanup.draft(source, vocabulary: rules) { [weak self] progress in self?.cleanupStatus = progress }
+                try Task.checkCancellation()
+                guard var latest = recordings.first(where: { $0.id == id }), latest.reviewText == source else { cleanupStatus = "Transcript changed; request a new draft."; return }
+                latest.cleanupDraft = draft; try persist(latest); replace(latest)
+                cleanupStatus = "Draft ready. Review before accepting."
+            } catch { cleanupStatus = Task.isCancelled ? "Cleanup cancelled. Transcript retained." : error.localizedDescription }
+        }
+    }
+    func cancelCleanup() { cleanupTask?.cancel() }
+    func reviewDraft(_ id: UUID, accept: Bool) {
+        guard var r = recordings.first(where: { $0.id == id }) else { return }
+        if accept, let draft = r.cleanupDraft { r.correctedTranscript = draft }
+        r.cleanupDraft = nil
+        do { try persist(r); replace(r) } catch { report(error) }
     }
     func report(_ error: Error) { message = error.localizedDescription }
 }

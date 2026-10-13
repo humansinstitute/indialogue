@@ -17,7 +17,9 @@ enum LocalSpeech {
         guard #available(iOS 26, *), SpeechTranscriber.isAvailable,
               let locale = await SpeechTranscriber.supportedLocale(equivalentTo: .current) else { throw RecorderError.unavailable }
         let module = SpeechTranscriber(locale: locale, preset: .transcription)
-        if let request = try await AssetInventory.assetInstallationRequest(supporting: [module]) {
+        let installed = await AssetInventory.status(forModules: [module]) == .installed
+        guard installed || download else { throw RecorderError.modelRequired }
+        if !installed, let request = try await AssetInventory.assetInstallationRequest(supporting: [module]) {
             guard download else { throw RecorderError.modelRequired }
             try await request.downloadAndInstall()
         }
