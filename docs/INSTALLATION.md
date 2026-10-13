@@ -32,3 +32,5 @@ xcrun devicectl device install app --device YOUR_PAIRED_DEVICE_IDENTIFIER \
 No `-allowProvisioningUpdates` is used: missing signing assets should be handled deliberately in Xcode. Installation and launch are separate actions; this guide does not imply either was performed. Private device identifiers and run evidence belong only in ignored `tmp/docs/handoffs/`. Add any custom build output path to local ignores before building.
 
 Microphone denial: Settings → Privacy & Security → Microphone → Pete Recorder. An active recording must start after first unlock following reboot. Subsequent locking is supported by the audio background mode and file protection policy, subject to physical-device validation.
+
+For the recorder feedback update, rebuild version 1.3 **build 7** from the reviewed commit before Rick's signed in-place installation. Existing build 6 signed artifacts do not contain these fixes. Keep the same bundle ID, team and installation; complete the microphone/level-history physical checks in VALIDATION.md after installation.

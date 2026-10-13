@@ -42,6 +42,19 @@ final class RecorderModel: NSObject, ObservableObject, AVAudioRecorderDelegate, 
     let store: RecordingStore?
     let transfers: NStackTransfers
     private var snapshotTask: Task<Void, Never>?
+    @Published var levels = CaptureLevels()
+    private var routeHistory = CaptureRouteHistory()
+    #if DEBUG && targetEnvironment(simulator)
+    private var syntheticFeedback = false
+    func showSyntheticCaptureFeedback() {
+        syntheticFeedback = true
+        active = Recording(title: "Synthetic meter")
+        actualInput = "Synthetic microphone"
+        levels.start()
+        for value: Float in [-65, -55, -48, -40, -25, -12, -6, -18, -32, -50] { levels.append(decibels: value) }
+    }
+    #endif
+    private var startupInterrupted = false
     private var capturePending = false
     private var recorder: AVAudioRecorder?
     private var player: AVAudioPlayer?
@@ -94,6 +107,9 @@ final class RecorderModel: NSObject, ObservableObject, AVAudioRecorderDelegate, 
         }.joined(separator: ", ")
         if actualInput.isEmpty { actualInput = "No active input" }
     }
+    private var routeSnapshot: [CaptureInput] {
+        session.currentRoute.inputs.map { CaptureInput(uid: $0.uid, source: $0.selectedDataSource?.dataSourceID.stringValue, name: $0.portName) }
+    }
     func prepareInputs() async {
         guard await AVAudioApplication.requestRecordPermission() else {
             message = "Microphone access denied. Enable it in Settings → Privacy & Security → Microphone → Pete Recorder."
@@ -127,7 +143,7 @@ final class RecorderModel: NSObject, ObservableObject, AVAudioRecorderDelegate, 
     }
     func start() async {
         guard !capturePending, active == nil, (!busy || snapshotTask != nil), let store else { return }
-        capturePending = true; defer { capturePending = false }
+        capturePending = true; startupInterrupted = false; defer { capturePending = false }
         if let snapshotTask { snapshotTask.cancel(); await snapshotTask.value }
         prioritizeCapture()
         message = nil
@@ -140,13 +156,28 @@ final class RecorderModel: NSObject, ObservableObject, AVAudioRecorderDelegate, 
             try session.setActive(true)
             let requestedInput = selectedInputUID.flatMap { uid in session.availableInputs?.first { $0.uid == uid } }
             try session.setPreferredInput(requestedInput) // A vanished preference must not masquerade as an actual route.
+            // Route selection can complete asynchronously. Yield without opening another capture.
+            try await waitForPreferredCaptureInput(uid: requestedInput?.uid, current: { self.routeSnapshot },
+                                                   interrupted: { self.startupInterrupted })
+            guard !startupInterrupted else { throw RecorderError.capture }
+            try Task.checkCancellation()
             refreshRoute()
             var r = Recording(title: Date.now.formatted(date: .abbreviated, time: .shortened))
             r.events.append("Started with \(actualInput)")
             if preferredInputAvailable == false { r.events.append("Preferred microphone unavailable: \(selectedInputName). Actual route: \(actualInput)") }
             try store.save(r) // Intent is durable before the microphone starts.
             active = r; elapsed = 0
+            levels.start()
             try beginSegment()
+            refreshRoute()
+            routeHistory.start(routeSnapshot)
+            if var started = active {
+                started.events[0] = "Started with \(actualInput)"
+                if let requestedInput, !session.currentRoute.inputs.contains(where: { $0.uid == requestedInput.uid }) {
+                    started.events.append("Preferred microphone request not yet reflected in actual route: \(selectedInputName); actual: \(actualInput)")
+                }
+                try persist(started); active = started
+            }
             timer = Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { [weak self] _ in
                 Task { @MainActor in self?.tick() }
             }
@@ -166,6 +197,7 @@ final class RecorderModel: NSObject, ObservableObject, AVAudioRecorderDelegate, 
         active = r
         let next = try AVAudioRecorder(url: store.audio(r, name), settings: [AVFormatIDKey: kAudioFormatMPEG4AAC, AVSampleRateKey: 44100, AVNumberOfChannelsKey: 1, AVEncoderBitRateKey: 96000])
         next.delegate = self
+        next.isMeteringEnabled = !suspended
         guard next.prepareToRecord() else { throw RecorderError.capture }
         try FileManager.default.setAttributes([.protectionKey: FileProtectionType.completeUntilFirstUserAuthentication], ofItemAtPath: next.url.path)
         guard next.record(forDuration: 15) else { throw RecorderError.capture }
@@ -174,6 +206,9 @@ final class RecorderModel: NSObject, ObservableObject, AVAudioRecorderDelegate, 
     private func tick() {
         guard let r = active, let recorder else { return }
         elapsed = r.duration + recorder.currentTime
+        guard !suspended, recorder.isRecording else { return }
+        recorder.updateMeters()
+        levels.append(decibels: recorder.averagePower(forChannel: 0))
     }
     private func closeSegment() throws {
         guard var r = active else { return }
@@ -187,6 +222,7 @@ final class RecorderModel: NSObject, ObservableObject, AVAudioRecorderDelegate, 
     }
     func stop(interrupted: Bool = false) {
         timer?.invalidate(); timer = nil
+        levels.stop(); routeHistory.stop()
         guard active != nil else { return }
         var finalSegmentFailed = false
         do { try closeSegment() } catch { finalSegmentFailed = true; report(error) }
@@ -212,16 +248,20 @@ final class RecorderModel: NSObject, ObservableObject, AVAudioRecorderDelegate, 
                 preferredInputAvailable = false
             }
             if var r = active {
-                r.events.append("Route changed: \(actualInput)")
-                do { try persist(r); active = r } catch { report(error); stop(interrupted: true); return }
-                message = "Microphone route changed: \(actualInput)."
-                if session.currentRoute.inputs.isEmpty || recorder?.isRecording != true {
+                let change = routeHistory.observe(routeSnapshot, capturing: recorder?.isRecording == true)
+                if change.changed {
+                    let reason = note.userInfo?[AVAudioSessionRouteChangeReasonKey] as? UInt ?? 0
+                    r.events.append("Route changed: \(actualInput) (reason \(reason))")
+                    do { try persist(r); active = r } catch { report(error); stop(interrupted: true); return }
+                }
+                if change.lostInput {
                     message = "Input unavailable or capture stopped after route change. Saved segments retained."
                     stop(interrupted: true)
                 }
             }
         } else if note.name == AVAudioSession.mediaServicesWereResetNotification ||
             (note.userInfo?[AVAudioSessionInterruptionTypeKey] as? UInt) == AVAudioSession.InterruptionType.began.rawValue {
+            if capturePending { startupInterrupted = true }
             message = "Audio interrupted. Saved segments retained. Start a new recording when ready."
             stop(interrupted: true); stopPlayback()
         }
@@ -345,8 +385,14 @@ final class RecorderModel: NSObject, ObservableObject, AVAudioRecorderDelegate, 
             transcriptionTask?.cancel()
         }
     }
-    func background() { snapshotTask?.cancel(); suspended = true; deferTranscription(); cancelCleanup() }
-    func foreground() { suspended = false; refreshRoute(); resumeTranscriptionQueue(); resumeUploadSnapshots() }
+    func background() { recorder?.isMeteringEnabled = false; levels.pause(); snapshotTask?.cancel(); suspended = true; deferTranscription(); cancelCleanup() }
+    func foreground() {
+        suspended = false; recorder?.isMeteringEnabled = true; levels.pause()
+        refreshRoute(); resumeTranscriptionQueue(); resumeUploadSnapshots()
+        #if DEBUG && targetEnvironment(simulator)
+        if syntheticFeedback { showSyntheticCaptureFeedback() }
+        #endif
+    }
     private func transcribe(_ r: Recording, download: Bool) async {
         transcribing = true
         defer {

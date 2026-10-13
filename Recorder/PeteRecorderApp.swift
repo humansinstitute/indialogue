@@ -12,6 +12,13 @@ struct PeteRecorderApp: App {
         _identity = StateObject(wrappedValue: IdentityModel())
         #endif
         #if DEBUG && targetEnvironment(simulator)
+        if ProcessInfo.processInfo.arguments.contains("--synthetic-meter") {
+            let root = FileManager.default.temporaryDirectory.appendingPathComponent("UIMeter-" + UUID().uuidString)
+            let model = RecorderModel(root: root)
+            model.showSyntheticCaptureFeedback()
+            _model = StateObject(wrappedValue: model)
+            return
+        }
         if ProcessInfo.processInfo.arguments.contains("--synthetic-review") {
             let root = FileManager.default.temporaryDirectory.appendingPathComponent("UIReview-" + UUID().uuidString)
             let model = RecorderModel(root: root)
@@ -61,6 +68,7 @@ struct RecorderView: View {
                     }.frame(maxWidth: .infinity).padding()
                 }.buttonStyle(.bordered).accessibilityIdentifier("microphoneControl").disabled(model.busy)
                 if model.active != nil {
+                    CaptureLevelView(levels: model.levels)
                     Text(Duration.seconds(model.elapsed).formatted(.time(pattern: .hourMinuteSecond)))
                         .font(.largeTitle.monospacedDigit()).accessibilityLabel("Recording duration")
                 }

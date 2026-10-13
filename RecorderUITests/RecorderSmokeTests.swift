@@ -106,3 +106,13 @@ extension RecorderSmokeTests {
         XCTAssertTrue(unlock.waitForExistence(timeout:10))
     }
 }
+
+extension RecorderSmokeTests {
+    func testSyntheticMeterWithoutMicrophoneCapture() {
+        let app = XCUIApplication(); app.launchArguments = ["--synthetic-meter"]; app.launch()
+        XCTAssertTrue(app.otherElements["captureLevelHistory"].waitForExistence(timeout: 10))
+        XCTAssertTrue(app.buttons["microphoneControl"].label.contains("Synthetic microphone"))
+        XCTAssertFalse(app.alerts["Recorder notice"].exists)
+        let image = XCTAttachment(screenshot: app.screenshot()); image.name = "Synthetic live recording levels"; image.lifetime = .keepAlways; add(image)
+    }
+}
