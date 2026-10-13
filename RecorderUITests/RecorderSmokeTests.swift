@@ -50,3 +50,19 @@ extension RecorderSmokeTests {
         let review = XCTAttachment(screenshot: app.screenshot()); review.name = "Synthetic word correction retains original"; review.lifetime = .keepAlways; add(review)
     }
 }
+
+extension RecorderSmokeTests {
+    func testNStackSetupAndHistoryWithoutSecretsOrCapture() {
+        let app = XCUIApplication(); app.launchArguments = ["--synthetic-review"]; app.launch()
+        XCTAssertTrue(app.buttons["menuButton"].waitForExistence(timeout:10)); app.buttons["menuButton"].tap()
+        app.buttons["NStack"].tap()
+        XCTAssertTrue(app.navigationBars["NStack"].waitForExistence(timeout:5))
+        XCTAssertTrue(app.textFields["https://your-nstack.example"].exists)
+        XCTAssertFalse(app.buttons["Discover workspaces"].isEnabled)
+        let setup = XCTAttachment(screenshot:app.screenshot()); setup.name = "NStack setup locked identity"; setup.lifetime = .keepAlways; add(setup)
+        app.navigationBars.buttons.element(boundBy:0).tap(); app.buttons["NStack uploads"].tap()
+        XCTAssertTrue(app.navigationBars["NStack uploads"].waitForExistence(timeout:5))
+        XCTAssertTrue(app.staticTexts["No uploads yet. Configure NStack or use Upload on a saved recording."].exists)
+        let history = XCTAttachment(screenshot:app.screenshot()); history.name = "NStack upload history"; history.lifetime = .keepAlways; add(history)
+    }
+}

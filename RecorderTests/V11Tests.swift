@@ -232,3 +232,21 @@ final class TranscriptionQueueTests: XCTestCase {
         XCTAssertEqual(try store.load()[0].transcript, "Recovered")
     }
 }
+
+extension IdentityVaultTests {
+    func testNostrSigningInsideSyntheticVaultAndLockedRefusal() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at:root) }
+        let vault = IdentityVault(url:root.appendingPathComponent("vault.json"),secrets:MemorySecrets())
+        try vault.create(nsec:nsec([UInt8](repeating:0,count:31) + [1]),pin:"123456")
+        let event = try vault.sign(kind:1,tags:[["t","é / 😀"]],content:"Synthetic Nostr verification",createdAt:1700000000)
+        XCTAssertEqual(event.pubkey,"79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798")
+        XCTAssertEqual(event.id,NostrCodec.hash(try NostrCodec.json([0,event.pubkey,event.created_at,event.kind,event.tags,event.content])))
+        XCTAssertTrue(NostrCodec.validNpub(try vault.signerNpub()))
+        let attachment = XCTAttachment(data:try JSONEncoder().encode(event),uniformTypeIdentifier:"public.json")
+        attachment.name = "Synthetic scalar-one Nostr event"; attachment.lifetime = .keepAlways; add(attachment)
+        // Public synthetic event only; allows independent nostr-tools verification after the suite.
+        try JSONEncoder().encode(event).write(to:FileManager.default.temporaryDirectory.appendingPathComponent("recorder-synthetic-event.json"))
+        vault.lock(); XCTAssertThrowsError(try vault.signerNpub()); XCTAssertThrowsError(try vault.sign(kind:1,tags:[],content:""))
+    }
+}

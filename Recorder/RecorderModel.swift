@@ -40,6 +40,9 @@ final class RecorderModel: NSObject, ObservableObject, AVAudioRecorderDelegate, 
     private var transcriptionTask: Task<Void, Never>?
     @Published var speechStatus = "Local transcription requires iOS 26 and a supported device/language."
     let store: RecordingStore?
+    let transfers: NStackTransfers
+    private var snapshotTask: Task<Void, Never>?
+    private var capturePending = false
     private var recorder: AVAudioRecorder?
     private var player: AVAudioPlayer?
     private var playbackRecord: Recording?
@@ -62,6 +65,7 @@ final class RecorderModel: NSObject, ObservableObject, AVAudioRecorderDelegate, 
             candidate = s
             if !s.warnings.isEmpty { failure = s.warnings.joined(separator: "\n") }
         } catch { failure = "Library unavailable: \(error.localizedDescription). Existing files have not been deleted." }
+        transfers = NStackTransfers(root: requestedRoot.map { $0.deletingLastPathComponent().appendingPathComponent($0.lastPathComponent + "-transfers") } ?? (candidate?.root.deletingLastPathComponent() ?? FileManager.default.temporaryDirectory).appendingPathComponent("NStack"))
         store = candidate
         super.init()
         recordings = loaded; message = failure
@@ -75,7 +79,7 @@ final class RecorderModel: NSObject, ObservableObject, AVAudioRecorderDelegate, 
                 Task { @MainActor in self?.notification(note) }
             })
         }
-        Task { speechStatus = await LocalSpeech.status(); resumeTranscriptionQueue() }
+        Task { speechStatus = await LocalSpeech.status(); resumeTranscriptionQueue(); resumeUploadSnapshots() }
     }
     func refreshRoute() {
         let availableInputs = session.availableInputs
@@ -122,7 +126,9 @@ final class RecorderModel: NSObject, ObservableObject, AVAudioRecorderDelegate, 
         } catch { report(error) }
     }
     func start() async {
-        guard active == nil, !busy, let store else { return }
+        guard !capturePending, active == nil, (!busy || snapshotTask != nil), let store else { return }
+        capturePending = true; defer { capturePending = false }
+        if let snapshotTask { snapshotTask.cancel(); await snapshotTask.value }
         prioritizeCapture()
         message = nil
         busy = true; defer { busy = false; if active == nil { resumeTranscriptionQueue() } }
@@ -182,11 +188,12 @@ final class RecorderModel: NSObject, ObservableObject, AVAudioRecorderDelegate, 
     func stop(interrupted: Bool = false) {
         timer?.invalidate(); timer = nil
         guard active != nil else { return }
-        do { try closeSegment() } catch { report(error) }
+        var finalSegmentFailed = false
+        do { try closeSegment() } catch { finalSegmentFailed = true; report(error) }
         if var r = active {
-            r.state = interrupted ? .interrupted : .saved
-            if !interrupted { r.transcriptionState = .queued; r.transcriptionNotice = "Queued for transcription using installed speech model." }
-            if interrupted { r.events.append("Capture stopped unexpectedly; inspect saved audio before resuming a new recording.") }
+            r.state = interrupted || finalSegmentFailed ? .interrupted : .saved
+            if !interrupted && !finalSegmentFailed { transfers.rememberNew(r); r.transcriptionState = .queued; r.transcriptionNotice = "Queued for transcription using installed speech model." }
+            if interrupted || finalSegmentFailed { r.events.append("Capture stopped unexpectedly; inspect saved audio before resuming a new recording.") }
             do { try persist(r) } catch { report(error) }
             recordings.removeAll { $0.id == r.id }; recordings.insert(r, at: 0)
         }
@@ -281,7 +288,8 @@ final class RecorderModel: NSObject, ObservableObject, AVAudioRecorderDelegate, 
         }
     }
     func stopPlayback() { player?.stop(); player = nil; playing = nil; playbackRecord = nil; if active == nil { try? session.setActive(false, options: .notifyOthersOnDeactivation) } }
-    func export(_ r: Recording) async throws -> URL {
+    func export(_ r: Recording, requireComplete: Bool = false) async throws -> URL {
+        if requireComplete && r.state != .saved { throw NStackError.incomplete }
         guard let store else { throw RecorderError.capture }
         let composition = AVMutableComposition()
         guard let track = composition.addMutableTrack(withMediaType: .audio, preferredTrackID: kCMPersistentTrackID_Invalid) else { throw RecorderError.capture }
@@ -296,6 +304,8 @@ final class RecorderModel: NSObject, ObservableObject, AVAudioRecorderDelegate, 
                 time = time + duration
             } catch { skipped.append(name) }
         }
+        if requireComplete && !skipped.isEmpty { throw NStackError.incomplete }
+        try Task.checkCancellation()
         guard time > .zero else { throw RecorderError.capture }
         if !skipped.isEmpty { message = "Shared playable audio only. Unreadable segments omitted: \(skipped.joined(separator: ", ")). Original files retained." }
         let output = FileManager.default.temporaryDirectory.appendingPathComponent(r.id.uuidString + "-" + UUID().uuidString + ".m4a")
@@ -327,7 +337,7 @@ final class RecorderModel: NSObject, ObservableObject, AVAudioRecorderDelegate, 
         if let id = transcriptionID { updateTranscription(id, state: .cancelled, notice: "Transcription cancelled. Audio retained; retry from this recording.") }
         transcriptionTask?.cancel()
     }
-    func prioritizeCapture() { deferTranscription(); cancelCleanup() }
+    func prioritizeCapture() { snapshotTask?.cancel(); deferTranscription(); cancelCleanup() }
     func deferTranscription() {
         if let id = transcriptionID {
             deferredTranscription = true
@@ -335,13 +345,13 @@ final class RecorderModel: NSObject, ObservableObject, AVAudioRecorderDelegate, 
             transcriptionTask?.cancel()
         }
     }
-    func background() { suspended = true; deferTranscription(); cancelCleanup() }
-    func foreground() { suspended = false; refreshRoute(); resumeTranscriptionQueue() }
+    func background() { snapshotTask?.cancel(); suspended = true; deferTranscription(); cancelCleanup() }
+    func foreground() { suspended = false; refreshRoute(); resumeTranscriptionQueue(); resumeUploadSnapshots() }
     private func transcribe(_ r: Recording, download: Bool) async {
         transcribing = true
         defer {
             transcribing = false; transcriptionID = nil; transcriptionTask = nil
-            resumeTranscriptionQueue()
+            resumeTranscriptionQueue(); resumeUploadSnapshots()
         }
         do {
             try Task.checkCancellation()
@@ -366,6 +376,29 @@ final class RecorderModel: NSObject, ObservableObject, AVAudioRecorderDelegate, 
             if Task.isCancelled {
                 if deferredTranscription { updateTranscription(r.id, state: .queued, notice: "Deferred; audio retained.") }
             } else { updateTranscription(r.id, state: .failed, notice: error.localizedDescription) }
+        }
+    }
+    func resumeUploadSnapshots() {
+        guard !capturePending, snapshotTask == nil, transcriptionTask == nil, active == nil, !suspended, !transcribing else { return }
+        guard let intent = transfers.intents.first(where: { intent in intent.notice == nil && recordings.contains { $0.id == intent.recordingID && $0.transcriptionState == .complete } }), let r = recordings.first(where: { $0.id == intent.recordingID }) else { return }
+        upload(r, destination: intent.destination)
+    }
+    var preparingUpload: Bool { snapshotTask != nil }
+    func upload(_ r: Recording, destination: NStackDestination? = nil) {
+        guard snapshotTask == nil, transcriptionTask == nil, active == nil, !suspended, !busy else { message = "Upload deferred while capture or local work is active."; return }
+        guard let d = destination ?? transfers.intents.first(where: { $0.recordingID == r.id })?.destination ?? transfers.destination else { message = "Configure NStack first."; return }
+        snapshotTask = Task {
+            busy = true
+            defer { busy = false; snapshotTask = nil; resumeTranscriptionQueue(); resumeUploadSnapshots() }
+            do {
+                guard r.transcriptionState == .complete else { throw NStackError.incomplete }
+                let corrected = TranscriptCorrections.apply(r.reviewText, vocabulary:vocabulary)
+                let audio: URL
+                if let audioExport { audio = try await audioExport(r) } else { audio = try await export(r, requireComplete:true) }
+                defer { try? FileManager.default.removeItem(at:audio) }
+                try Task.checkCancellation()
+                try transfers.enqueue(r,destination:d,audio:audio,corrected:corrected)
+            } catch { if !(error is CancellationError) { transfers.snapshotFailed(r.id,error:error); report(error) } }
         }
     }
     func saveVocabulary(_ rules: [VocabularyCorrection]) {

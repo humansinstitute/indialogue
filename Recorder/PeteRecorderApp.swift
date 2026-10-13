@@ -24,6 +24,8 @@ struct PeteRecorderApp: App {
 struct ShareFile: Identifiable { let id = UUID(); let url: URL }
 struct RecorderView: View {
     @ObservedObject var model: RecorderModel
+    @ObservedObject var transfers: NStackTransfers
+    init(model: RecorderModel) { self.model = model; self.transfers = model.transfers }
     @Environment(\.scenePhase) private var scenePhase
     @StateObject private var identity = IdentityModel()
     @State private var menuOpen = false
@@ -57,7 +59,7 @@ struct RecorderView: View {
                     Label(model.active == nil ? "Start recording" : "Stop and save", systemImage: model.active == nil ? "record.circle" : "stop.circle.fill")
                         .font(.title3.bold()).frame(maxWidth: .infinity).padding(.vertical, 12)
                 }.buttonStyle(.borderedProminent).tint(.red)
-                    .disabled(model.busy || model.store == nil).accessibilityIdentifier("recordButton")
+                    .disabled((model.busy && !model.preparingUpload) || model.store == nil).accessibilityIdentifier("recordButton")
                 Spacer()
             }.padding(24).navigationTitle("Pete Recorder")
                 .toolbar {
@@ -92,8 +94,14 @@ struct RecorderView: View {
                 .alert("Download language model?", isPresented: Binding(get: { downloadTarget != nil }, set: { if !$0 { downloadTarget = nil } })) {
                     Button("Download and transcribe") { if let r = downloadTarget { model.startTranscription(r, download: true) }; downloadTarget = nil }
                     Button("Cancel", role: .cancel) { downloadTarget = nil }
-                } message: { Text("Apple may download a speech model using network and storage. Saved audio is processed on this device and is never uploaded by this app.") }
-        }
+                } message: { Text("Apple may download a speech model using network and storage. Transcription runs on this device. NStack uploads occur only with your saved setup or explicit Upload.") }
+        }.onChange(of:identity.npub) { _,_ in refreshTransfers() }
+        .onChange(of:model.active) { _,_ in refreshTransfers() }
+        .onChange(of:scenePhase) { _,_ in refreshTransfers() }
+        .onAppear { refreshTransfers() }
+    }
+    func refreshTransfers() {
+        transfers.setAvailability(active:scenePhase == .active && model.active == nil, signer:identity.npub, api:NStackAPI { try identity.sign(kind:$0,tags:$1,content:$2) })
     }
     var microphones: some View {
         NavigationStack {
@@ -116,6 +124,8 @@ struct RecorderView: View {
         NavigationStack {
             List {
                 Section {
+                    NavigationLink("NStack") { NStackSettings(transfers:transfers,identity:identity) }
+                    NavigationLink("NStack uploads") { NStackHistory(transfers:transfers) }
                     NavigationLink("Identity") { IdentitySettings(model: identity) }
                     NavigationLink("Vocabulary") { VocabularySettings(model: model) }
                     NavigationLink("Notices and status") {
@@ -165,6 +175,11 @@ struct RecorderView: View {
                     }.disabled(model.busy || model.active != nil)
                     Button("Rename", systemImage: "pencil") { selected = nil; renameText = r.title; renameTarget = r }.disabled(model.busy)
                     Button("Delete", systemImage: "trash", role: .destructive) { selected = nil; deleteTarget = r }.disabled(model.busy)
+                }
+                Section("NStack delivery") {
+                    if let status = transfers.status(r.id) { Text(status) }
+                    Button("Upload corrected transcript and audio") { model.upload(r) }.disabled(model.busy || model.active != nil || r.transcriptionState != .complete)
+                    Text("Uses current reviewed text with saved vocabulary. Unaccepted cleanup drafts are excluded.").font(.footnote)
                 }
                 Section("Local transcription") {
                     Text(model.speechStatus).font(.footnote)

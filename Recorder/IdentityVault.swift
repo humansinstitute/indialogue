@@ -3,6 +3,7 @@ import CryptoKit
 import CommonCrypto
 import Security
 import SwiftUI
+import P256K
 
 enum VaultError: LocalizedError {
     case invalidNsec, invalidPIN, exists, unavailable, invalidVault
@@ -80,7 +81,7 @@ struct RecorderKeychain: VaultSecretStore {
 }
 
 /// Only the encrypted scalar goes to disk. The installation secret never leaves Keychain.
-/// No key derivation/signing or npub is invented; Tower integration is separate.
+/// Signing stays inside the vault; transport only receives public identity and events.
 final class IdentityVault {
     struct Envelope: Codable {
         var version = 1
@@ -141,6 +142,22 @@ final class IdentityVault {
         } catch { throw VaultError.invalidVault }
     }
     func lock() { if clear != nil { clear!.resetBytes(in: 0..<clear!.count) }; clear = nil }
+    func signerNpub() throws -> String {
+        guard let clear else { throw VaultError.unavailable }
+        let key = try P256K.Schnorr.PrivateKey(dataRepresentation: clear)
+        return NostrCodec.npub(Data(key.xonly.bytes))
+    }
+    func sign(kind: Int, tags: [[String]], content: String, createdAt: Int = Int(Date().timeIntervalSince1970)) throws -> NostrEvent {
+        guard let clear else { throw VaultError.unavailable }
+        let key = try P256K.Schnorr.PrivateKey(dataRepresentation: clear)
+        let pubkey = Data(key.xonly.bytes).hex
+        let serialized = try NostrCodec.json([0, pubkey, createdAt, kind, tags, content])
+        var digest = Array(SHA256.hash(data: serialized))
+        var auxiliary = [UInt8](try random(32))
+        defer { _ = auxiliary.withUnsafeMutableBytes { $0.initializeMemory(as: UInt8.self, repeating: 0) }; _ = digest.withUnsafeMutableBytes { $0.initializeMemory(as: UInt8.self, repeating: 0) } }
+        let signature = try key.signature(message: &digest, auxiliaryRand: &auxiliary)
+        return NostrEvent(id: NostrCodec.hash(serialized), pubkey: pubkey, created_at: createdAt, kind: kind, tags: tags, content: content, sig: Data(signature.dataRepresentation).hex)
+    }
     func remove() throws {
         lock()
         if exists { try FileManager.default.removeItem(at: url) }
@@ -154,6 +171,7 @@ final class IdentityModel: ObservableObject {
     @Published private(set) var unlocked = false
     @Published var notice: String?
     private let vault: IdentityVault?
+    @Published private(set) var npub: String?
     init() {
         let root = try? FileManager.default.url(for: .applicationSupportDirectory, in: .userDomainMask, appropriateFor: nil, create: true)
         vault = root.map { IdentityVault(url: $0.appendingPathComponent("Identity/vault.json")) }
@@ -162,7 +180,11 @@ final class IdentityModel: ObservableObject {
     func perform(_ operation: (IdentityVault) throws -> Void) {
         guard let vault else { notice = "Identity storage unavailable."; return }
         do { try operation(vault); notice = nil } catch { notice = error.localizedDescription }
-        exists = vault.exists; unlocked = vault.isUnlocked
+        exists = vault.exists; unlocked = vault.isUnlocked; npub = try? vault.signerNpub()
     }
-    func lock() { vault?.lock(); unlocked = false }
+    func lock() { vault?.lock(); unlocked = false; npub = nil }
+    func sign(kind: Int, tags: [[String]], content: String) throws -> NostrEvent {
+        guard let vault else { throw VaultError.unavailable }
+        return try vault.sign(kind: kind, tags: tags, content: content)
+    }
 }
