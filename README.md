@@ -1,5 +1,7 @@
 # In Dialogue
 
+Native clients: [iPhone installation](docs/INSTALLATION.md) · [Android app and build guide](android/README.md). Android APK releases are available through [Zapstore](https://zapstore.dev/apps/com.wingmanbefree.indialogue) and the [release catalog](https://github.com/OtherStuffAI/in-dialogue/releases). Both native codebases share this repository; Android lives under `android/`.
+
 Native SwiftUI iPhone recorder, version 1.3 (build 8), for iOS 18+. Open `Recorder.xcodeproj` in Xcode 26.3 and select `PeteRecorder`.
 
 The capture screen has a microphone preference control, a left menu and Start recording. During capture it shows the actual input, elapsed time, a live recording level history and Stop and save. The microphone picker requests permission and discovers iOS-supported inputs when opened. A preference is used when available; the actual capture route remains authoritative. Recordings, notices, identity and vocabulary live in the menu. Important audio failures also show an alert.
