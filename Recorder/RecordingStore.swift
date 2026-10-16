@@ -16,11 +16,12 @@ struct Recording: Codable, Identifiable, Equatable {
     var cleanupDraft: String?
     var transcriptionState: TranscriptionState = .none
     var transcriptionNotice: String?
+    var dialogueRoute: DialogueRouteSnapshot?
     enum TranscriptionState: String, Codable { case none, queued, running, complete, failed, cancelled }
     var reviewText: String { correctedTranscript ?? transcript ?? "" }
     enum CodingKeys: String, CodingKey {
         case schemaVersion, id, title, createdAt, state, segments, duration, events, transcript, transcriptionLocale
-        case correctedTranscript, cleanupDraft, transcriptionState, transcriptionNotice
+        case correctedTranscript, cleanupDraft, transcriptionState, transcriptionNotice, dialogueRoute
     }
     init(title: String) { self.title = title }
     init(from decoder: Decoder) throws {
@@ -39,6 +40,7 @@ struct Recording: Codable, Identifiable, Equatable {
         cleanupDraft = try c.decodeIfPresent(String.self, forKey: .cleanupDraft)
         transcriptionState = try c.decodeIfPresent(TranscriptionState.self, forKey: .transcriptionState) ?? (transcript == nil ? .none : .complete)
         transcriptionNotice = try c.decodeIfPresent(String.self, forKey: .transcriptionNotice)
+        dialogueRoute = try c.decodeIfPresent(DialogueRouteSnapshot.self, forKey: .dialogueRoute)
     }
     enum State: String, Codable { case recording, saved, interrupted }
 }

@@ -54,6 +54,7 @@ struct RecorderView: View {
     @State private var menuOpen = false
     @State private var pendingRecording: Recording?
     @State private var micOpen = false
+    @State private var routeOpen = false
     @State private var criticalNotice = false
     @State private var selected: Recording?
     @State private var renameText = ""
@@ -63,8 +64,26 @@ struct RecorderView: View {
     @State private var share: ShareFile?
     var body: some View {
         NavigationStack {
-            VStack(spacing: 28) {
+            ScrollView {
+                VStack(spacing: 28) {
                 Spacer()
+                VStack(alignment:.leading,spacing:10) {
+                    Picker("Conversation mode",selection:Binding(get:{ transfers.routing.mode },set:{ mode in
+                        do { try transfers.setMode(mode); if !routeConfigured(mode) { routeOpen = true } }
+                        catch { model.report(error) }
+                    })) {
+                        ForEach(DialogueMode.allCases) { Text($0.rawValue).tag($0) }
+                    }.pickerStyle(.segmented).controlSize(.large).accessibilityIdentifier("dialogueMode")
+                    Button { routeOpen = true } label: {
+                        HStack {
+                            VStack(alignment:.leading,spacing:3) {
+                                Text(routeSummary).font(.headline)
+                                Text("Choose destination and instructions").font(.caption)
+                            }
+                            Spacer(); Image(systemName:"chevron.right")
+                        }.frame(maxWidth:.infinity).padding(.vertical,8)
+                    }.buttonStyle(.bordered).accessibilityIdentifier("routeSettings")
+                }
                 Button { micOpen = true; Task { await model.prepareInputs() } } label: {
                     VStack(spacing: 8) {
                         Image(systemName: "mic.fill").font(.largeTitle)
@@ -84,8 +103,14 @@ struct RecorderView: View {
                         .font(.title3.bold()).frame(maxWidth: .infinity).padding(.vertical, 12)
                 }.buttonStyle(.borderedProminent).tint(.red)
                     .disabled((model.busy && !model.preparingUpload) || model.store == nil).accessibilityIdentifier("recordButton")
+                if model.active == nil, let job = transfers.latestConversationJob {
+                    conversation(job)
+                }
                 Spacer()
-            }.padding(24).navigationTitle("In Dialogue")
+                Text("Use only when it is safe and lawful to interact with your phone. Replies refresh in the foreground and need a network connection.")
+                    .font(.caption).foregroundStyle(.secondary).multilineTextAlignment(.center)
+                }.padding(24)
+            }.navigationTitle("In Dialogue")
                 .toolbar {
                     ToolbarItem(placement: .topBarLeading) {
                         Button { menuOpen = true } label: {
@@ -99,6 +124,12 @@ struct RecorderView: View {
                     requestUnlock()
                 }) { menu }
                 .sheet(isPresented: $micOpen, onDismiss: { requestUnlock() }) { microphones }
+                .sheet(isPresented:$routeOpen,onDismiss:{ requestUnlock() }) {
+                    NavigationStack {
+                        NStackSettings(transfers:transfers,identity:identity)
+                            .toolbar { ToolbarItem(placement:.confirmationAction) { Button("Done") { routeOpen = false } } }
+                    }
+                }
                 .onChange(of: scenePhase) { _, phase in
                     if phase == .active { model.foreground(); requestUnlock() }
                     else if phase == .background { unlockOpen = false; unlockPolicy.background(); model.background() }
@@ -129,11 +160,41 @@ struct RecorderView: View {
             IdentityUnlock(model: identity) { unlockOpen = false; refreshTransfers() }
         }
     }
+    func routeConfigured(_ mode: DialogueMode) -> Bool {
+        switch mode { case .normal: transfers.destination != nil; case .channel: transfers.routing.channel != nil; case .agent: transfers.routing.agent != nil }
+    }
+    var routeSummary: String {
+        let mode = transfers.routing.mode
+        let d = transfers.routing.destination(normal:transfers.destination)
+        guard let d else { return "Set up \(mode.rawValue)" }
+        if mode == .normal { return "Normal · \(d.channelLabel)" }
+        if mode == .agent { return "Agent · \(d.recipientLabel ?? "Choose agent")" }
+        return "Channel · \(d.channelLabel)"
+    }
+    func conversation(_ job: TransferJob) -> some View {
+        VStack(alignment:.leading,spacing:10) {
+            HStack { Text("Conversation").font(.headline); Spacer(); Button("Refresh reply") { Task { await transfers.refreshReply(for:job.id) } } }
+            if let conversation = job.conversationID, let reply = transfers.replies[conversation] {
+                Text(reply.sender).font(.subheadline.bold())
+                Text(reply.body).frame(maxWidth:.infinity,alignment:.leading).accessibilityIdentifier("replyText")
+                Button(transfers.playingReplyID == reply.id ? "Stop reply" : reply.audioObjectID == nil ? "Listen to reply" : "Play reply audio", systemImage:transfers.playingReplyID == reply.id ? "stop.fill" : "play.fill") {
+                    transfers.toggleReplyPlayback(reply,for:job.id)
+                }.buttonStyle(.bordered)
+                Button { if let route = transfers.followupRoute(for:job) { Task { await model.start(route:route) } } } label: {
+                    Label("Respond",systemImage:"mic.fill").font(.title3.bold()).frame(maxWidth:.infinity).padding(.vertical,8)
+                }.buttonStyle(.borderedProminent).accessibilityIdentifier("respondButton")
+            } else {
+                Text(transfers.replyNotice ?? "Sent. Refresh when a reply is expected.").font(.footnote).foregroundStyle(.secondary)
+            }
+        }.padding().background(.thinMaterial,in:RoundedRectangle(cornerRadius:16)).accessibilityElement(children:.contain)
+            .task(id:job.id) { await transfers.refreshReply(for:job.id) }
+    }
     func requestUnlock() {
         guard scenePhase == .active, identity.exists, !identity.unlocked, !unlockPolicy.requested else { return }
         // Let an existing sheet finish dismissing before presenting authentication.
         if menuOpen { menuOpen = false; return }
         if micOpen { micOpen = false; return }
+        if routeOpen { routeOpen = false; return }
         if selected != nil { selected = nil; return }
         if share != nil { share = nil; return }
         if unlockPolicy.request(active: scenePhase == .active, exists: identity.exists, unlocked: identity.unlocked) { unlockOpen = true }

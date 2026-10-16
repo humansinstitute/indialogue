@@ -2,6 +2,7 @@ import Foundation
 import CryptoKit
 import SwiftUI
 import CoreFoundation
+import AVFoundation
 
 /// Storage APIs serialize bigint byte counts as either JSON integers or decimal strings.
 enum StorageMetadata {
@@ -55,10 +56,13 @@ struct TransferJob: Codable, Identifiable, Equatable {
     var lastAttempt: Date?
     var messageID: String?
     var threadID: String?
+    var conversationID: UUID?
+    var dialogueMode: DialogueMode?
 }
 struct AutomaticUploadIntent: Codable {
     let recordingID: UUID
     let destination: NStackDestination
+    var route: DialogueRouteSnapshot?
     var notice: String?
 }
 /// Independent of views. Atomic ledger contains no secret or Authorization headers.
@@ -66,6 +70,10 @@ struct AutomaticUploadIntent: Codable {
 final class NStackTransfers: ObservableObject {
     @Published private(set) var jobs: [TransferJob] = []
     @Published private(set) var destination: NStackDestination?
+    @Published private(set) var routing = DialogueRouting()
+    @Published private(set) var replies: [UUID:DialogueReply] = [:]
+    @Published var replyNotice: String?
+    @Published private(set) var playingReplyID: String?
     @Published var notice: String?
     private(set) var intents: [AutomaticUploadIntent] = []
     let root: URL
@@ -74,7 +82,31 @@ final class NStackTransfers: ObservableObject {
     private var allowed = false
     private var currentSigner: String?
     private var api: NStackAPI?
-    struct Ledger: Codable { var jobs: [TransferJob]; var intents: [AutomaticUploadIntent]; var destination: NStackDestination? }
+    private var replyPlayer: AVAudioPlayer?
+    private let speech = AVSpeechSynthesizer()
+    private lazy var playbackDelegate = ReplyPlaybackDelegate { [weak self] in
+        Task { @MainActor in
+            self?.replyPlayer = nil
+            self?.playingReplyID = nil
+        }
+    }
+    struct Ledger: Codable {
+        var jobs: [TransferJob]
+        var intents: [AutomaticUploadIntent]
+        var destination: NStackDestination?
+        var routing: DialogueRouting
+        enum CodingKeys: String, CodingKey { case jobs, intents, destination, routing }
+        init(jobs:[TransferJob],intents:[AutomaticUploadIntent],destination:NStackDestination?,routing:DialogueRouting = DialogueRouting()) {
+            self.jobs = jobs; self.intents = intents; self.destination = destination; self.routing = routing
+        }
+        init(from decoder: Decoder) throws {
+            let c = try decoder.container(keyedBy:CodingKeys.self)
+            jobs = try c.decodeIfPresent([TransferJob].self,forKey:.jobs) ?? []
+            intents = try c.decodeIfPresent([AutomaticUploadIntent].self,forKey:.intents) ?? []
+            destination = try c.decodeIfPresent(NStackDestination.self,forKey:.destination)
+            routing = try c.decodeIfPresent(DialogueRouting.self,forKey:.routing) ?? DialogueRouting()
+        }
+    }
     init(root: URL) {
         self.root = root
         do {
@@ -83,7 +115,7 @@ final class NStackTransfers: ObservableObject {
             let path = root.appendingPathComponent("ledger.json")
             if FileManager.default.fileExists(atPath: path.path) {
                 let ledger = try JSONDecoder().decode(Ledger.self, from: Data(contentsOf: path))
-                jobs = ledger.jobs; intents = ledger.intents; destination = ledger.destination
+                jobs = ledger.jobs; intents = ledger.intents; destination = ledger.destination; routing = ledger.routing
                 for i in jobs.indices where ["uploading","posting"].contains(jobs[i].state) { jobs[i].state = "queued" }
             }
         } catch { readable = false; notice = "Transfer ledger unreadable; retained and cannot be overwritten. \(error.localizedDescription)" }
@@ -109,12 +141,39 @@ final class NStackTransfers: ObservableObject {
     }
     func persist() throws {
         guard readable else { throw NStackError.malformed }
-        try JSONEncoder().encode(Ledger(jobs: jobs, intents: intents, destination: destination)).write(to: root.appendingPathComponent("ledger.json"), options: [.atomic, .completeFileProtectionUntilFirstUserAuthentication])
+        try JSONEncoder().encode(Ledger(jobs:jobs,intents:intents,destination:destination,routing:routing)).write(to: root.appendingPathComponent("ledger.json"), options: [.atomic, .completeFileProtectionUntilFirstUserAuthentication])
     }
     func save(_ d: NStackDestination) throws { try d.validate(); destination = d; try persist() }
+    func setMode(_ mode: DialogueMode) throws { routing.mode = mode; try persist() }
+    func saveRoute(_ destination: NStackDestination, mode: DialogueMode) throws {
+        try destination.validate()
+        switch mode {
+        case .normal: self.destination = destination
+        case .channel:
+            guard destination.recipient == nil else { throw NStackError.invalidSetup }
+            routing.channel = destination
+        case .agent:
+            guard destination.recipient != nil else { throw NStackError.invalidSetup }
+            routing.agent = destination
+        }
+        routing.mode = mode
+        try persist()
+    }
+    func captureRoute() -> DialogueRouteSnapshot? {
+        guard let selected = routing.destination(normal:destination) else { return nil }
+        return DialogueRouteSnapshot(mode:routing.mode,destination:selected,threadID:nil)
+    }
+    func followupRoute(for job: TransferJob) -> DialogueRouteSnapshot? {
+        guard let thread = job.threadID, let conversation = job.conversationID else { return nil }
+        return DialogueRouteSnapshot(conversationID:conversation,mode:job.dialogueMode ?? job.routeMode,destination:job.destination,threadID:thread)
+    }
+    var latestConversationJob: TransferJob? {
+        jobs.reversed().first { $0.state == "sent" && $0.threadID != nil && $0.conversationID != nil }
+    }
     func rememberNew(_ r: Recording) {
-        guard let d = destination, d.automatic else { return }
-        intents.append(AutomaticUploadIntent(recordingID: r.id, destination: d))
+        let route = r.dialogueRoute
+        guard let d = route?.destination ?? destination, d.automatic else { return }
+        intents.append(AutomaticUploadIntent(recordingID:r.id,destination:d,route:route))
         do { try persist() } catch { notice = error.localizedDescription }
     }
     func snapshotFailed(_ id: UUID, error: Error) {
@@ -133,6 +192,10 @@ final class NStackTransfers: ObservableObject {
         return (count,Data(hash.finalize()).hex)
     }
     func enqueue(_ r: Recording, destination d: NStackDestination, audio: URL, corrected: String) throws {
+        try enqueue(r,route:r.dialogueRoute ?? DialogueRouteSnapshot(mode:.normal,destination:d,threadID:nil),audio:audio,corrected:corrected)
+    }
+    func enqueue(_ r: Recording, route: DialogueRouteSnapshot, audio: URL, corrected: String) throws {
+        let d = route.destination
         try d.validate()
         guard r.state == .saved, r.transcriptionState == .complete, !r.segments.isEmpty else { throw NStackError.incomplete }
         guard !jobs.contains(where: { $0.recordingID == r.id && $0.state != "cancelled" }) else { return }
@@ -145,7 +208,7 @@ final class NStackTransfers: ObservableObject {
         let transcript = try NostrCodec.json(artifact); try transcript.write(to: directory.appendingPathComponent("transcript.json"), options: .atomic)
         let mention = d.recipient.map { "@[\(d.recipientLabel!)](mention:agent:\($0))\n\n" } ?? ""
         let body = (mention + d.prompt + "\n\n" + r.title + "\n\n" + String(corrected.prefix(4000)) + "\n\nFull corrected transcript and audio attached.").trimmingCharacters(in: .whitespacesAndNewlines)
-        jobs.append(TransferJob(id:id,recordingID:r.id,destination:d,title:r.title.isEmpty ? "Recording" : r.title,body:body,files:[TransferFile(name:"recording.m4a",mime:"audio/mp4",size:size,checksum:hash),TransferFile(name:"transcript.json",mime:"application/json",size:transcript.count,checksum:NostrCodec.hash(transcript))]))
+        jobs.append(TransferJob(id:id,recordingID:r.id,destination:d,title:r.title.isEmpty ? "Recording" : r.title,body:body,files:[TransferFile(name:"recording.m4a",mime:"audio/mp4",size:size,checksum:hash),TransferFile(name:"transcript.json",mime:"application/json",size:transcript.count,checksum:NostrCodec.hash(transcript))],threadID:route.threadID,conversationID:route.conversationID,dialogueMode:route.mode))
         let last = jobs.count - 1
         if currentSigner == nil { jobs[last].state = "paused_locked"; jobs[last].notice = "Unlock identity while the app is active to send." }
         else if currentSigner != d.signer { jobs[last].state = "paused_identity" }
@@ -155,7 +218,7 @@ final class NStackTransfers: ObservableObject {
     }
     func setAvailability(active: Bool, signer: String?, api: NStackAPI) {
         self.api = api; currentSigner = signer; allowed = active && signer != nil
-        if !allowed { worker?.cancel() }
+        if !allowed { worker?.cancel(); stopReply() }
         for i in jobs.indices where !["sent","cancelled","failed"].contains(jobs[i].state) {
             if !active { jobs[i].state = "paused_capture_or_background" }
             else if signer == nil { jobs[i].state = "paused_locked" }
@@ -224,5 +287,79 @@ final class NStackTransfers: ObservableObject {
         guard let message = response["message"] as? [String:Any], let id = message["id"] as? String else { throw NStackError.malformed }
         jobs[i].messageID = id; jobs[i].threadID = (response["thread"] as? [String:Any])?["id"] as? String ?? message["thread_id"] as? String
         jobs[i].state = "sent"; jobs[i].notice = nil; try persist()
+    }
+
+    func refreshReply(for jobID: UUID) async {
+        guard allowed, let api, let job = jobs.first(where:{$0.id == jobID}), let thread = job.threadID,
+              let conversation = job.conversationID else { replyNotice = "Replies refresh only in the foreground with the matching identity unlocked."; return }
+        do {
+            let base = "/api/v4/flightdeck-pg/workspaces/\(job.destination.workspace)/channels/\(job.destination.channel)/messages"
+            let own = Set(jobs.filter{$0.conversationID == conversation}.compactMap(\.messageID))
+            let allowedQuery = CharacterSet.alphanumerics.union(CharacterSet(charactersIn:"-._~"))
+            let encodedThread = thread.addingPercentEncoding(withAllowedCharacters:allowedQuery) ?? thread
+            var cursor: String?, seen = Set<String>(), newest: DialogueReply?
+            repeat {
+                var path = base + "?thread_id=" + encodedThread + "&effective_transcript=true&limit=200"
+                if let cursor {
+                    guard seen.insert(cursor).inserted else { throw NStackError.malformed }
+                    path += "&cursor=" + (cursor.addingPercentEncoding(withAllowedCharacters:allowedQuery) ?? cursor)
+                }
+                let result = try await api.request(origin:job.destination.origin,path:path,app:job.destination.appNpub)
+                guard let messages = result["messages"] as? [[String:Any]] else { throw NStackError.malformed }
+                for reply in messages.compactMap({ Self.reply($0) }) where !own.contains(reply.id) {
+                    if newest == nil || (reply.createdAt ?? .distantFuture) >= (newest?.createdAt ?? .distantPast) { newest = reply }
+                }
+                cursor = result["next_cursor"] as? String
+            } while cursor != nil
+            if let newest { replies[conversation] = newest; replyNotice = nil }
+            else { replyNotice = "No new reply yet. Pull to refresh or tap Refresh reply while the app is in the foreground." }
+        } catch { replyNotice = error.localizedDescription }
+    }
+    static func reply(_ message: [String:Any]) -> DialogueReply? {
+        guard let id = message["id"] as? String, let body = message["body"] as? String, message["deleted_at"] == nil else { return nil }
+        let metadata = message["metadata"] as? [String:Any]
+        let attachments = message["attachments"] as? [[String:Any]] ?? metadata?["attachments"] as? [[String:Any]] ?? []
+        let audio = attachments.first { entry in
+            let mime = entry["mime_type"] as? String ?? entry["content_type"] as? String ?? ""
+            return mime.lowercased().hasPrefix("audio/")
+        }?["storage_object_id"] as? String
+        let date = (message["created_at"] as? String).flatMap { ISO8601DateFormatter().date(from:$0) }
+        let sender = message["created_by_actor_label"] as? String ?? message["sender_label"] as? String ?? "Reply"
+        return DialogueReply(id:id,body:body,sender:sender,createdAt:date,audioObjectID:audio)
+    }
+    func toggleReplyPlayback(_ reply: DialogueReply, for jobID: UUID) {
+        if playingReplyID == reply.id { stopReply(); return }
+        stopReply(); playingReplyID = reply.id
+        if let object = reply.audioObjectID, let job = jobs.first(where:{$0.id == jobID}), let api, allowed {
+            Task {
+                do {
+                    let data = try await api.download(origin:job.destination.origin,path:"/api/v4/storage/\(object)/content",app:job.destination.appNpub)
+                    guard playingReplyID == reply.id else { return }
+                    replyPlayer = try AVAudioPlayer(data:data)
+                    replyPlayer?.delegate = playbackDelegate
+                    guard replyPlayer?.play() == true else { throw NStackError.malformed }
+                } catch { playingReplyID = nil; replyNotice = error.localizedDescription }
+            }
+        } else {
+            let utterance = AVSpeechUtterance(string:reply.body)
+            utterance.voice = AVSpeechSynthesisVoice(language:Locale.current.language.languageCode?.identifier)
+            speech.delegate = playbackDelegate
+            speech.speak(utterance)
+        }
+    }
+    func stopReply() { replyPlayer?.stop(); replyPlayer = nil; speech.stopSpeaking(at:.immediate); playingReplyID = nil }
+}
+
+private final class ReplyPlaybackDelegate: NSObject, AVAudioPlayerDelegate, AVSpeechSynthesizerDelegate {
+    let finished: () -> Void
+    init(finished:@escaping () -> Void) { self.finished = finished }
+    func audioPlayerDidFinishPlaying(_ player: AVAudioPlayer, successfully flag: Bool) { finished() }
+    func speechSynthesizer(_ synthesizer: AVSpeechSynthesizer, didFinish utterance: AVSpeechUtterance) { finished() }
+}
+
+private extension TransferJob {
+    var routeMode: DialogueMode {
+        if destination.recipient != nil { return .agent }
+        return .channel
     }
 }

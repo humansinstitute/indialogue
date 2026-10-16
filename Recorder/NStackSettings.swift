@@ -17,11 +17,22 @@ struct NStackSettings: View {
     @State private var recipientLabel = ""
     @State private var prompt = "Please review this recording."
     @State private var automatic = false
+    @State private var captureMode: DialogueMode
     @State private var loading = false
     @State private var notice: String?
+    init(transfers: NStackTransfers, identity: IdentityModel) {
+        self.transfers = transfers; self.identity = identity
+        _captureMode = State(initialValue:transfers.routing.mode)
+    }
     private var api: NStackAPI { NStackAPI { try identity.sign(kind:$0,tags:$1,content:$2) } }
     var body: some View {
         Form {
+            Section("Dialogue capture mode") {
+                Picker("Mode",selection:$captureMode) {
+                    ForEach(DialogueMode.allCases) { Text($0.rawValue).tag($0) }
+                }.pickerStyle(.segmented)
+                Text(captureMode == .normal ? "Uses the ordinary saved automatic or manual destination." : captureMode == .channel ? "Starts a conversation in the selected channel without an agent mention." : "Starts a conversation with the selected canonical agent and instruction.").font(.footnote)
+            }
             Section("Connection") {
                 TextField("https://your-nstack.example", text:$origin).textInputAutocapitalization(.never).autocorrectionDisabled().keyboardType(.URL)
                 Text(identity.npub ?? "Unlock your imported Nostr identity to discover destinations.").font(.footnote).textSelection(.enabled)
@@ -54,30 +65,45 @@ struct NStackSettings: View {
                 TextEditor(text:$prompt).frame(minHeight:100).accessibilityLabel("Custom prompt")
                 Toggle("Automatically upload new recordings",isOn:$automatic)
                 Text("New recordings wait for transcription and vocabulary corrections. Existing recordings require Upload. Unlock identity while the app is active to send. Audio stays on this device if delivery fails.").font(.footnote)
-                Button("Save NStack setup") {
+                Button("Save \(captureMode.rawValue) route") {
                     do {
                         guard let workspace, let channel, let signer = identity.npub else { throw NStackError.invalidSetup }
                         let trimmed = recipient.trimmingCharacters(in:.whitespacesAndNewlines)
-                        let d = NStackDestination(origin:try NStackAPI.origin(origin).absoluteString,signer:signer,workspace:workspace.id,workspaceLabel:workspace.label,appNpub:workspace.app,channel:channel.id,channelLabel:channel.label,recipient:trimmed.isEmpty ? nil : trimmed,recipientLabel:trimmed.isEmpty ? nil : recipientLabel.trimmingCharacters(in:.whitespacesAndNewlines),prompt:prompt.trimmingCharacters(in:.whitespacesAndNewlines),automatic:automatic)
-                        try transfers.save(d); notice = "Saved. Automatic uploads apply only to newly completed recordings."
+                        let routedRecipient = captureMode == .agent && !trimmed.isEmpty ? trimmed : nil
+                        let d = NStackDestination(origin:try NStackAPI.origin(origin).absoluteString,signer:signer,workspace:workspace.id,workspaceLabel:workspace.label,appNpub:workspace.app,channel:channel.id,channelLabel:channel.label,recipient:routedRecipient,recipientLabel:routedRecipient == nil ? nil : recipientLabel.trimmingCharacters(in:.whitespacesAndNewlines),prompt:prompt.trimmingCharacters(in:.whitespacesAndNewlines),automatic:automatic)
+                        try transfers.saveRoute(d,mode:captureMode); notice = "Saved. This route is copied into each new recording; later settings changes do not retarget it."
                     } catch { notice = error.localizedDescription }
                 }.disabled(loading || !identity.unlocked)
-                if let saved = transfers.destination { Text("Saved: \(saved.workspaceLabel) → \(saved.channelLabel)\n\(saved.signer)").font(.footnote).textSelection(.enabled) }
+                if let saved = savedRoute { Text("Saved: \(saved.workspaceLabel) → \(saved.channelLabel)\n\(saved.signer)").font(.footnote).textSelection(.enabled) }
             }
         }.navigationTitle("NStack")
             .onAppear {
                 guard !restored else { return }; restored = true
-                if let d = transfers.destination {
+                if let d = savedRoute {
                     origin = d.origin; prompt = d.prompt; automatic = d.automatic
                     recipient = d.recipient ?? ""; recipientLabel = d.recipientLabel ?? ""
                     restoreSelection(d)
                 }
             }
+            .onChange(of:captureMode) { _,_ in loadSavedRoute() }
             .onChange(of:origin) { _,_ in
                 reset()
-                if let d = transfers.destination, d.origin == origin { restoreSelection(d) }
+                if let d = savedRoute, d.origin == origin { restoreSelection(d) }
             }
             .onChange(of:identity.npub) { _,_ in reset() }
+    }
+    var savedRoute: NStackDestination? {
+        switch captureMode {
+        case .normal: transfers.destination
+        case .channel: transfers.routing.channel
+        case .agent: transfers.routing.agent
+        }
+    }
+    func loadSavedRoute() {
+        guard let d = savedRoute else { return }
+        origin = d.origin; prompt = d.prompt; automatic = d.automatic
+        recipient = d.recipient ?? ""; recipientLabel = d.recipientLabel ?? ""
+        restoreSelection(d)
     }
     func restoreSelection(_ d: NStackDestination) {
         let choices = NStackDiscovery.savedSelections(d)

@@ -190,8 +190,10 @@ final class RecorderModel: NSObject, ObservableObject, AVAudioRecorderDelegate, 
             refreshRoute()
         } catch { report(error) }
     }
-    func start() async {
+    func start(route requestedRoute: DialogueRouteSnapshot? = nil) async {
         guard !capturePending, active == nil, (!busy || snapshotTask != nil), let store else { return }
+        // Capture routing before any permission prompt, audio-session wait or mutable settings read.
+        let immutableRoute = requestedRoute ?? transfers.captureRoute()
         capturePending = true; startupInterrupted = false; defer { capturePending = false }
         if let snapshotTask { snapshotTask.cancel(); await snapshotTask.value }
         prioritizeCapture()
@@ -212,6 +214,7 @@ final class RecorderModel: NSObject, ObservableObject, AVAudioRecorderDelegate, 
             try Task.checkCancellation()
             refreshRoute()
             var r = Recording(title: Date.now.formatted(date: .abbreviated, time: .shortened))
+            r.dialogueRoute = immutableRoute
             r.events.append("Started with \(actualInput)")
             if preferredInputAvailable == false { r.events.append("Preferred microphone unavailable: \(selectedInputName). Actual route: \(actualInput)") }
             try store.save(r) // Intent is durable before the microphone starts.
@@ -479,16 +482,17 @@ final class RecorderModel: NSObject, ObservableObject, AVAudioRecorderDelegate, 
     func resumeUploadSnapshots() {
         guard !capturePending, snapshotTask == nil, transcriptionTask == nil, active == nil, !suspended, !transcribing else { return }
         guard let intent = transfers.intents.first(where: { intent in intent.notice == nil && recordings.contains { $0.id == intent.recordingID && $0.transcriptionState == .complete } }), let r = recordings.first(where: { $0.id == intent.recordingID }) else { return }
-        upload(r, destination: intent.destination)
+        upload(r, destination:intent.destination, route:intent.route)
     }
     var preparingUpload: Bool { snapshotTask != nil }
-    func upload(_ r: Recording, destination: NStackDestination? = nil) {
+    func upload(_ r: Recording, destination: NStackDestination? = nil, route: DialogueRouteSnapshot? = nil) {
         guard snapshotTask == nil, transcriptionTask == nil, active == nil, !suspended, !busy else { message = "Upload deferred while capture or local work is active."; return }
         if let job = transfers.jobs.last(where: { $0.recordingID == r.id && $0.state != "cancelled" }) {
             if job.state == "failed" || job.state.hasPrefix("paused_") { transfers.retry(job.id) }
             return
         }
-        guard let d = destination ?? transfers.intents.first(where: { $0.recordingID == r.id })?.destination ?? transfers.destination else { message = "Configure NStack first."; return }
+        let immutableRoute = route ?? r.dialogueRoute ?? transfers.intents.first(where: { $0.recordingID == r.id })?.route
+        guard let d = immutableRoute?.destination ?? destination ?? transfers.intents.first(where: { $0.recordingID == r.id })?.destination ?? transfers.destination else { message = "Configure NStack first."; return }
         snapshotTask = Task {
             busy = true
             defer { busy = false; snapshotTask = nil; runRetention(); resumeTranscriptionQueue(); resumeUploadSnapshots() }
@@ -499,7 +503,7 @@ final class RecorderModel: NSObject, ObservableObject, AVAudioRecorderDelegate, 
                 if let audioExport { audio = try await audioExport(r) } else { audio = try await export(r, requireComplete:true) }
                 defer { try? FileManager.default.removeItem(at:audio) }
                 try Task.checkCancellation()
-                try transfers.enqueue(r,destination:d,audio:audio,corrected:corrected)
+                try transfers.enqueue(r,route:immutableRoute ?? DialogueRouteSnapshot(mode:.normal,destination:d,threadID:nil),audio:audio,corrected:corrected)
             } catch { if !(error is CancellationError) { transfers.snapshotFailed(r.id,error:error); report(error) } }
         }
     }

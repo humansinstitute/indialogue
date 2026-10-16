@@ -145,6 +145,102 @@ extension NStackTests {
     }
 }
 
+extension NStackTests {
+    func testDialogueModePersistenceAndImmutableRouteSnapshot() throws {
+        let root = temp(); defer { try? FileManager.default.removeItem(at:root) }
+        let queue = NStackTransfers(root:root)
+        let normal = destination()
+        var channel = normal; channel.channel = UUID().uuidString; channel.channelLabel = "Home / Ideas"; channel.recipient = nil; channel.recipientLabel = nil
+        var agent = normal; agent.prompt = "Summarise this and propose the next action."
+        try queue.saveRoute(normal,mode:.normal)
+        try queue.saveRoute(channel,mode:.channel)
+        try queue.saveRoute(agent,mode:.agent)
+        try queue.setMode(.channel)
+        let snapshot = try XCTUnwrap(queue.captureRoute())
+        XCTAssertEqual(snapshot.mode,.channel); XCTAssertEqual(snapshot.destination,channel)
+
+        var changed = channel; changed.channel = UUID().uuidString; changed.prompt = "Changed later"
+        try queue.saveRoute(changed,mode:.channel)
+        XCTAssertEqual(snapshot.destination,channel)
+        let restored = NStackTransfers(root:root)
+        XCTAssertEqual(restored.routing.mode,.channel); XCTAssertEqual(restored.routing.channel,changed); XCTAssertEqual(restored.routing.agent,agent)
+
+        var recording = record(); recording.dialogueRoute = snapshot
+        let decoded = try JSONDecoder().decode(Recording.self,from:JSONEncoder().encode(recording))
+        XCTAssertEqual(decoded.dialogueRoute,snapshot)
+    }
+
+    func testChannelAndAgentPayloadsUseOneCanonicalIdentity() throws {
+        let root = temp(); defer { try? FileManager.default.removeItem(at:root) }
+        let queue = NStackTransfers(root:root), audio = root.appendingPathComponent("audio")
+        try Data([1]).write(to:audio)
+        var channel = destination(); channel.recipient = nil; channel.recipientLabel = nil
+        var first = record(); first.id = UUID()
+        try queue.enqueue(first,route:DialogueRouteSnapshot(mode:.channel,destination:channel,threadID:nil),audio:audio,corrected:"Channel message")
+        var channelJob = queue.jobs[0]; for i in channelJob.files.indices { channelJob.files[i].objectID = UUID().uuidString }
+        let channelPayload = try api().message(channelJob)
+        XCTAssertNil(channelPayload["mentions"]); XCTAssertFalse(channelJob.body.contains("mention:agent:"))
+
+        var second = record(); second.id = UUID()
+        try queue.enqueue(second,route:DialogueRouteSnapshot(mode:.agent,destination:destination(),threadID:nil),audio:audio,corrected:"Agent message")
+        var agentJob = queue.jobs[1]; for i in agentJob.files.indices { agentJob.files[i].objectID = UUID().uuidString }
+        let agentPayload = try api().message(agentJob)
+        let structured = try XCTUnwrap((agentPayload["mentions"] as? [[String:String]])?.first)
+        XCTAssertEqual(structured["npub"],destination().recipient)
+        XCTAssertTrue(agentJob.body.hasPrefix("@[\(structured["label"]!)](mention:agent:\(structured["npub"]!))"))
+    }
+
+    func testInitialThreadAndSameThreadFollowupPayloads() throws {
+        let root = temp(); defer { try? FileManager.default.removeItem(at:root) }
+        let queue = NStackTransfers(root:root), audio = root.appendingPathComponent("audio")
+        try Data([1]).write(to:audio)
+        let conversation = UUID(), thread = UUID().uuidString
+        var first = record(); first.id = UUID()
+        try queue.enqueue(first,route:DialogueRouteSnapshot(conversationID:conversation,mode:.agent,destination:destination(),threadID:nil),audio:audio,corrected:"First")
+        let initial = try api { _,tags,_ in XCTAssertFalse(tags.contains(where:{$0.first == "thread_id"})) }.message(queue.jobs[0])
+        XCTAssertEqual(initial["create_thread"] as? Bool,true); XCTAssertNil(initial["thread_id"])
+
+        var second = record(); second.id = UUID()
+        try queue.enqueue(second,route:DialogueRouteSnapshot(conversationID:conversation,mode:.agent,destination:destination(),threadID:thread),audio:audio,corrected:"Follow up")
+        let follow = try api { _,tags,_ in XCTAssertTrue(tags.contains(["thread_id",thread])) }.message(queue.jobs[1])
+        XCTAssertEqual(follow["thread_id"] as? String,thread); XCTAssertNil(follow["create_thread"])
+        XCTAssertEqual(follow["client_request_id"] as? String,queue.jobs[1].id.uuidString)
+        XCTAssertEqual(queue.jobs[1].conversationID,conversation)
+    }
+
+    func testReplyRetrievalNewestAudioAndLockedFailure() async throws {
+        let root = temp(); defer { try? FileManager.default.removeItem(at:root) }
+        let queue = NStackTransfers(root:root), audio = root.appendingPathComponent("audio")
+        try Data([1]).write(to:audio)
+        try queue.enqueue(record(),route:DialogueRouteSnapshot(mode:.agent,destination:destination(),threadID:nil),audio:audio,corrected:"First")
+        var ledger = NStackTransfers.Ledger(jobs:queue.jobs,intents:[],destination:nil)
+        ledger.jobs[0].state = "sent"; ledger.jobs[0].messageID = "mine"; ledger.jobs[0].threadID = UUID().uuidString
+        try JSONEncoder().encode(ledger).write(to:root.appendingPathComponent("ledger.json"))
+        let restored = NStackTransfers(root:root); var calls = 0
+        MockNStackProtocol.handler = { request in
+            calls += 1; XCTAssertTrue(request.url!.query!.contains("effective_transcript=true"))
+            if calls == 1 {
+                XCTAssertNil(URLComponents(url:request.url!,resolvingAgainstBaseURL:false)?.queryItems?.first(where:{$0.name == "cursor"}))
+                return (200,["messages":[
+                    ["id":"mine","body":"My request","created_at":"2026-10-16T01:00:00Z"],
+                    ["id":"older","body":"First answer","created_at":"2026-10-16T01:01:00Z"]
+                ],"next_cursor":"page + two"])
+            }
+            XCTAssertEqual(URLComponents(url:request.url!,resolvingAgainstBaseURL:false)?.queryItems?.first(where:{$0.name == "cursor"})?.value,"page + two")
+            return (200,["messages":[
+                ["id":"reply","body":"Here is the answer","created_by_actor_label":"Rick","created_at":"2026-10-16T01:02:00Z","attachments":[["mime_type":"audio/mp4","storage_object_id":"audio-object"]]]
+            ]])
+        }
+        restored.setAvailability(active:true,signer:npub,api:api())
+        await restored.refreshReply(for:restored.jobs[0].id)
+        let reply = try XCTUnwrap(restored.replies[restored.jobs[0].conversationID!])
+        XCTAssertEqual(reply.body,"Here is the answer"); XCTAssertEqual(reply.audioObjectID,"audio-object"); XCTAssertEqual(reply.sender,"Rick")
+        restored.setAvailability(active:false,signer:nil,api:api())
+        await restored.refreshReply(for:restored.jobs[0].id)
+        XCTAssertEqual(calls,2); XCTAssertTrue(restored.replyNotice?.contains("foreground") == true)
+    }
+}
+
 // Bitcoin BIP340 official test vector 0, public synthetic scalar 3.
 extension NStackTests {
     func testOfficialBIP340VectorZero() throws {

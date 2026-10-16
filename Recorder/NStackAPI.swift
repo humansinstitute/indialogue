@@ -21,6 +21,46 @@ struct NStackDestination: Codable, Equatable {
             !label.contains(where: { "[]()\n\r".contains($0) }) else { throw NStackError.invalidSetup } }
     }
 }
+
+enum DialogueMode: String, Codable, CaseIterable, Identifiable {
+    case normal = "Normal"
+    case channel = "Channel"
+    case agent = "Agent"
+    var id: String { rawValue }
+}
+
+/// Persistent capture choice. Channel and agent destinations are complete values so changing
+/// the ordinary NStack setup cannot partially retarget one of these modes.
+struct DialogueRouting: Codable, Equatable {
+    var mode: DialogueMode = .normal
+    var channel: NStackDestination?
+    var agent: NStackDestination?
+
+    func destination(normal: NStackDestination?) -> NStackDestination? {
+        switch mode {
+        case .normal: normal
+        case .channel: channel
+        case .agent: agent
+        }
+    }
+}
+
+/// Immutable route captured when recording begins. Follow-ups copy this value and add the
+/// already-created thread rather than consulting mutable settings.
+struct DialogueRouteSnapshot: Codable, Equatable {
+    var conversationID = UUID()
+    var mode: DialogueMode
+    var destination: NStackDestination
+    var threadID: String?
+}
+
+struct DialogueReply: Identifiable, Equatable {
+    let id: String
+    let body: String
+    let sender: String
+    let createdAt: Date?
+    let audioObjectID: String?
+}
 enum NStackError: LocalizedError {
     case discoveryLimit
     case invalidSetup, unsafeURL, response(Int), malformed, incomplete, fallbackLimit, prepareUncertain
@@ -83,6 +123,19 @@ final class NStackAPI {
         guard let result = try JSONSerialization.jsonObject(with: data) as? [String: Any] else { throw NStackError.malformed }
         return result
     }
+    func download(origin: String, path: String, app: String? = nil) async throws -> Data {
+        try Task.checkCancellation()
+        let url = try Self.url(origin, path)
+        let event = try sign(27235, Self.authTags(url:url,method:"GET",bytes:nil), "")
+        var request = URLRequest(url:url)
+        request.setValue("Nostr " + (try JSONEncoder().encode(event)).base64EncodedString(), forHTTPHeaderField:"Authorization")
+        if let app { request.setValue(app,forHTTPHeaderField:"x-flightdeck-pg-app-npub") }
+        let (data,response) = try await session.data(for:request)
+        try Task.checkCancellation()
+        guard let http = response as? HTTPURLResponse else { throw NStackError.malformed }
+        guard (200..<300).contains(http.statusCode) else { throw NStackError.response(http.statusCode) }
+        return data
+    }
     func putFile(_ file: URL, upload: String, origin: String, object: String, mime: String, size: Int) async throws {
         guard let url = URL(string: upload), url.user == nil, url.password == nil, url.fragment == nil else { throw NStackError.unsafeURL }
         let local = try Self.url(origin, "/api/v4/storage/\(object)")
@@ -99,11 +152,15 @@ final class NStackAPI {
     }
     func message(_ job: TransferJob) throws -> [String: Any] {
         let d = job.destination; let hash = NostrCodec.hash(Data(job.body.utf8))
-        let event = try sign(33358, [["protocol","flightdeck_pg_message_instruction"],["body_sha256",hash],["workspace_id",d.workspace],["channel_id",d.channel]], job.body)
+        var tags = [["protocol","flightdeck_pg_message_instruction"],["body_sha256",hash],["workspace_id",d.workspace],["channel_id",d.channel]]
+        if let thread = job.threadID { tags.append(["thread_id",thread]) }
+        let event = try sign(33358, tags, job.body)
         let encoded = try JSONSerialization.jsonObject(with: JSONEncoder().encode(event))
-        var body: [String: Any] = ["body":job.body,"create_thread":true,"thread_title":String(job.title.prefix(120)),"client_request_id":job.id.uuidString,
+        var body: [String: Any] = ["body":job.body,"client_request_id":job.id.uuidString,
             "message_signature":["version":1,"protocol":"flightdeck_pg_message_instruction","kind":33358,"signer_npub":d.signer,"body_sha256":hash,"nostr_event":encoded],
             "metadata":["attachments":job.files.map { ["kind":"file","storage_object_id":$0.objectID ?? "","filename":$0.name,"mime_type":$0.mime,"size_bytes":$0.size] as [String:Any] },"recorder":["recording_id":job.recordingID.uuidString,"snapshot_id":job.id.uuidString,"version":1]]]
+        if let thread = job.threadID { body["thread_id"] = thread }
+        else { body["create_thread"] = true; body["thread_title"] = String(job.title.prefix(120)) }
         if let recipient = d.recipient { body["mentions"] = [["type":"agent","npub":recipient,"label":d.recipientLabel!]] }
         return body
     }

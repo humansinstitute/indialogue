@@ -36,3 +36,15 @@ Microphone denial: Settings → Privacy & Security → Microphone → Pete Recor
 For the recorder feedback update, rebuild version 1.3 **build 7** from the reviewed commit before Rick's signed in-place installation. Existing build 6 signed artifacts do not contain these fixes. Keep the same bundle ID, team and installation; complete the microphone/level-history physical checks in VALIDATION.md after installation.
 
 For automatic retention, rebuild version 1.3 **build 8** from the reviewed commit before Rick's signed in-place installation. Menu → Settings defaults to deletion off. Verify that the previous library and identity remain available after updating; do not enable retention on real recordings during review unless Pete chooses to do so. Simulator fixtures exercise deletion only in isolated temporary libraries. Build 7 signed artifacts do not include retention.
+
+For the Dialogue voice loop, distribute version 1.3 **build 9**. It preserves the same bundle ID, Keychain access and Application Support paths. Verify Normal, Channel and Agent routes with a synthetic/test workspace identity first; then verify reply refresh, audio/text playback and at least two Respond turns in one thread. Foreground network access is required for refresh and delivery. No claim is made that interacting with the phone while driving is safe or lawful.
+
+## TestFlight release
+
+Use the existing Apple Distribution identity, team and App Store Connect app for `studio.otherstuff.PeteRecorder`; never create a replacement bundle ID or uninstall the phone app. After the reviewed commit passes the complete test suite and generic device build:
+
+1. In Xcode, select Any iOS Device (arm64), Product → Archive, and confirm the archive is version 1.3 build 9.
+2. Organizer → Distribute App → App Store Connect → Upload. Keep automatic signing only if it resolves the existing App Store distribution profile; do not switch teams.
+3. Wait for App Store Connect processing, confirm build 9 appears under TestFlight, then add it to the existing internal tester group. Apple agreements, export-compliance questions or interactive approval remain owner actions.
+
+For unattended release, an App Store Connect API key may authenticate `xcodebuild -exportArchive`/upload, but its private key, key ID, issuer ID, team ID, profile UUIDs and raw logs must stay outside this repository under ignored operational evidence. A successful archive is not TestFlight availability: record upload success and App Store Connect build readback. If an App Store provisioning profile cannot be resolved, stop after the archive and report that exact profile/App Store Connect action; do not use a development or wildcard profile for TestFlight.
