@@ -41,7 +41,7 @@ For the Dialogue voice loop, distribute version 1.3 **build 9**. It preserves th
 
 Build 9 filtered every live Tower message row because JSON `deleted_at: null` was mistaken for a deletion marker. Version 1.3 **build 10** fixes Reply Refresh against the typed effective-thread contract, distinguishes a genuinely empty thread from a malformed response, and leaves the saved route, signing identity, authorization and local data paths unchanged. Update in place and repeat the real reply plus two-turn Respond check before wider use.
 
-Version 1.3 **build 11** checks immediately and then every 20 seconds for replies while the latest sent conversation is visible, foregrounded and unlocked; it stops outside that lifecycle and keeps manual Refresh Reply. New Channel/Agent setup reuses a valid Tower identity and workspace from the installation, without rewriting saved routes or captured conversations. Update in place and verify automatic arrival, background/foreground resume, and route-specific setup before wider use.
+Version 1.3 **build 11** checks immediately and then every 20 seconds for replies while the latest sent conversation is visible, foregrounded and unlocked; it stops outside that lifecycle and keeps manual Refresh Reply. Each new reply auto-plays once, retains large manual Listen/Stop and Respond controls, and collapses into a green Responded/waiting state after response capture starts. New Channel/Agent setup reuses a valid Tower identity and workspace from the installation, without rewriting saved routes or captured conversations. Update in place and verify automatic arrival/playback, background/foreground deduplication, the responded/waiting round, and route-specific setup before wider use.
 
 ## TestFlight release
 

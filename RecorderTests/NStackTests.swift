@@ -284,7 +284,7 @@ extension NStackTests {
         }
         restored.setAvailability(active:true,signer:npub,api:api())
         var delays = 0
-        await restored.pollReplies(for:jobID) { duration in
+        await restored.pollReplies(for:jobID,autoPlay:false) { duration in
             XCTAssertEqual(duration,NStackTransfers.replyPollInterval)
             delays += 1
             restored.setAvailability(active:false,signer:nil,api:self.api())
@@ -293,7 +293,7 @@ extension NStackTests {
         XCTAssertEqual(restored.replies[conversation]?.id,"one-reply")
 
         restored.setAvailability(active:true,signer:npub,api:api())
-        await restored.pollReplies(for:jobID) { _ in throw CancellationError() }
+        await restored.pollReplies(for:jobID,autoPlay:false) { _ in throw CancellationError() }
         XCTAssertEqual(calls,2, "Resuming starts with another immediate check")
 
         let another = UUID()
@@ -303,6 +303,14 @@ extension NStackTests {
         restored.finishReplyRefresh(for:jobID); XCTAssertNil(restored.replyRefreshJobID)
         let same = try XCTUnwrap(restored.replies[conversation])
         XCTAssertFalse(restored.storeReply(same,for:conversation), "The same reply is not presented twice")
+        XCTAssertTrue(restored.claimReplyPlayback(same,for:jobID))
+        XCTAssertFalse(restored.claimReplyPlayback(same,for:jobID), "Auto-play is claimed only once")
+        restored.markResponded(to:same,for:jobID)
+        let restarted = NStackTransfers(root:root)
+        let state = try XCTUnwrap(restarted.replyStates[conversation])
+        XCTAssertEqual(state.lastPlayedID,same.id); XCTAssertEqual(state.lastRespondedID,same.id)
+        try restarted.deleteFinishedLocalArtifacts(ledger.jobs[0].recordingID)
+        XCTAssertNil(NStackTransfers(root:root).replyStates[conversation], "Finished local cleanup removes reply round metadata")
     }
 
     func testLegacyNormalSetupSeedsNewModesWithoutPersistingOrRetargeting() throws {
@@ -319,6 +327,7 @@ extension NStackTests {
         let agent = try XCTUnwrap(restored.setupSeed(for:.agent,signer:npub))
         XCTAssertEqual(agent.destination.workspace,normal.workspace); XCTAssertFalse(agent.saved)
         XCTAssertNil(restored.routing.channel); XCTAssertNil(restored.routing.agent)
+        XCTAssertTrue(restored.replyStates.isEmpty)
         XCTAssertNil(restored.setupSeed(for:.channel,signer:NostrCodec.npub(Data(repeating:2,count:32))))
 
         var savedAgent = normal; savedAgent.prompt = "Existing agent route"

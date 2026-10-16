@@ -65,6 +65,10 @@ struct AutomaticUploadIntent: Codable {
     var route: DialogueRouteSnapshot?
     var notice: String?
 }
+struct DialogueReplyState: Codable, Equatable {
+    var lastPlayedID: String?
+    var lastRespondedID: String?
+}
 /// Independent of views. Atomic ledger contains no secret or Authorization headers.
 @MainActor
 final class NStackTransfers: ObservableObject {
@@ -72,6 +76,7 @@ final class NStackTransfers: ObservableObject {
     @Published private(set) var destination: NStackDestination?
     @Published private(set) var routing = DialogueRouting()
     @Published private(set) var replies: [UUID:DialogueReply] = [:]
+    @Published private(set) var replyStates: [UUID:DialogueReplyState] = [:]
     @Published var replyNotice: String?
     @Published private(set) var playingReplyID: String?
     @Published var notice: String?
@@ -96,9 +101,10 @@ final class NStackTransfers: ObservableObject {
         var intents: [AutomaticUploadIntent]
         var destination: NStackDestination?
         var routing: DialogueRouting
-        enum CodingKeys: String, CodingKey { case jobs, intents, destination, routing }
-        init(jobs:[TransferJob],intents:[AutomaticUploadIntent],destination:NStackDestination?,routing:DialogueRouting = DialogueRouting()) {
-            self.jobs = jobs; self.intents = intents; self.destination = destination; self.routing = routing
+        var replyStates: [UUID:DialogueReplyState]
+        enum CodingKeys: String, CodingKey { case jobs, intents, destination, routing, replyStates }
+        init(jobs:[TransferJob],intents:[AutomaticUploadIntent],destination:NStackDestination?,routing:DialogueRouting = DialogueRouting(),replyStates:[UUID:DialogueReplyState] = [:]) {
+            self.jobs = jobs; self.intents = intents; self.destination = destination; self.routing = routing; self.replyStates = replyStates
         }
         init(from decoder: Decoder) throws {
             let c = try decoder.container(keyedBy:CodingKeys.self)
@@ -106,6 +112,7 @@ final class NStackTransfers: ObservableObject {
             intents = try c.decodeIfPresent([AutomaticUploadIntent].self,forKey:.intents) ?? []
             destination = try c.decodeIfPresent(NStackDestination.self,forKey:.destination)
             routing = try c.decodeIfPresent(DialogueRouting.self,forKey:.routing) ?? DialogueRouting()
+            replyStates = try c.decodeIfPresent([UUID:DialogueReplyState].self,forKey:.replyStates) ?? [:]
         }
     }
     init(root: URL) {
@@ -116,7 +123,7 @@ final class NStackTransfers: ObservableObject {
             let path = root.appendingPathComponent("ledger.json")
             if FileManager.default.fileExists(atPath: path.path) {
                 let ledger = try JSONDecoder().decode(Ledger.self, from: Data(contentsOf: path))
-                jobs = ledger.jobs; intents = ledger.intents; destination = ledger.destination; routing = ledger.routing
+                jobs = ledger.jobs; intents = ledger.intents; destination = ledger.destination; routing = ledger.routing; replyStates = ledger.replyStates
                 for i in jobs.indices where ["uploading","posting"].contains(jobs[i].state) { jobs[i].state = "queued" }
             }
         } catch { readable = false; notice = "Transfer ledger unreadable; retained and cannot be overwritten. \(error.localizedDescription)" }
@@ -131,18 +138,22 @@ final class NStackTransfers: ObservableObject {
     /// Remove finished local snapshots and their transcript-bearing ledger entries; never remote objects.
     func deleteFinishedLocalArtifacts(_ id: UUID) throws {
         guard retentionReady, !retentionProtects(id) else { throw NStackError.incomplete }
+        let removedConversations = Set(jobs.filter { $0.recordingID == id }.compactMap(\.conversationID))
         for job in jobs where job.recordingID == id {
             let directory = root.appendingPathComponent(job.id.uuidString)
             if FileManager.default.fileExists(atPath: directory.path) { try FileManager.default.removeItem(at: directory) }
         }
-        let previous = jobs
+        let previous = jobs, previousReplyStates = replyStates
         jobs.removeAll { $0.recordingID == id }
+        for conversation in removedConversations where !jobs.contains(where: { $0.conversationID == conversation }) {
+            replyStates.removeValue(forKey:conversation)
+        }
         do { try persist() }
-        catch { jobs = previous; throw error }
+        catch { jobs = previous; replyStates = previousReplyStates; throw error }
     }
     func persist() throws {
         guard readable else { throw NStackError.malformed }
-        try JSONEncoder().encode(Ledger(jobs:jobs,intents:intents,destination:destination,routing:routing)).write(to: root.appendingPathComponent("ledger.json"), options: [.atomic, .completeFileProtectionUntilFirstUserAuthentication])
+        try JSONEncoder().encode(Ledger(jobs:jobs,intents:intents,destination:destination,routing:routing,replyStates:replyStates)).write(to: root.appendingPathComponent("ledger.json"), options: [.atomic, .completeFileProtectionUntilFirstUserAuthentication])
     }
     func save(_ d: NStackDestination) throws { try d.validate(); destination = d; try persist() }
     func setMode(_ mode: DialogueMode) throws { routing.mode = mode; try persist() }
@@ -310,10 +321,10 @@ final class NStackTransfers: ObservableObject {
 
     static let replyPollInterval: Duration = .seconds(20)
     typealias ReplyPollDelay = (Duration) async throws -> Void
-    func pollReplies(for jobID: UUID, interval: Duration = replyPollInterval,
+    func pollReplies(for jobID: UUID, interval: Duration = replyPollInterval, autoPlay: Bool = true,
                      delay: @escaping ReplyPollDelay = { try await Task<Never, Never>.sleep(for:$0) }) async {
         while allowed, !Task.isCancelled {
-            await refreshReply(for:jobID)
+            if let reply = await refreshReply(for:jobID), autoPlay { autoPlayReplyIfNeeded(reply,for:jobID) }
             guard allowed, !Task.isCancelled else { return }
             do { try await delay(interval) }
             catch { return }
@@ -332,11 +343,11 @@ final class NStackTransfers: ObservableObject {
         replies[conversation] = reply
         return true
     }
-    func refreshReply(for jobID: UUID) async {
+    @discardableResult func refreshReply(for jobID: UUID) async -> DialogueReply? {
         guard allowed, let api, let job = jobs.first(where:{$0.id == jobID}), job.state == "sent",
               currentSigner == job.destination.signer, let thread = job.threadID,
-              let conversation = job.conversationID else { replyNotice = "Replies refresh only in the foreground with the matching identity unlocked."; return }
-        guard beginReplyRefresh(for:jobID) else { return }
+              let conversation = job.conversationID else { replyNotice = "Replies refresh only in the foreground with the matching identity unlocked."; return nil }
+        guard beginReplyRefresh(for:jobID) else { return nil }
         defer { finishReplyRefresh(for:jobID) }
         do {
             let base = "/api/v4/flightdeck-pg/workspaces/\(job.destination.workspace)/channels/\(job.destination.channel)/messages"
@@ -362,15 +373,17 @@ final class NStackTransfers: ObservableObject {
                 cursor = result["next_cursor"] as? String
             } while cursor != nil
             try Task.checkCancellation()
-            guard allowed, currentSigner == job.destination.signer else { return }
+            guard allowed, currentSigner == job.destination.signer else { return nil }
             if let newest {
-                storeReply(newest,for:conversation)
+                let inserted = storeReply(newest,for:conversation)
                 replyNotice = nil
+                return inserted ? newest : nil
             }
-            else { replyNotice = "No new reply yet. Pull to refresh or tap Refresh reply while the app is in the foreground." }
+            replyNotice = "No new reply yet. Pull to refresh or tap Refresh reply while the app is in the foreground."
         } catch {
             if !Task.isCancelled { replyNotice = error.localizedDescription }
         }
+        return nil
     }
     static func reply(_ message: [String:Any]) throws -> DialogueReply? {
         if message["record_state"] as? String == "deleted" { return nil }
@@ -393,8 +406,33 @@ final class NStackTransfers: ObservableObject {
         fractional.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
         return fractional.date(from:value) ?? ISO8601DateFormatter().date(from:value)
     }
+    func refreshAndPlayReply(for jobID: UUID) async {
+        if let reply = await refreshReply(for:jobID) { autoPlayReplyIfNeeded(reply,for:jobID) }
+    }
+    func claimReplyPlayback(_ reply: DialogueReply, for jobID: UUID) -> Bool {
+        guard let conversation = jobs.first(where:{$0.id == jobID})?.conversationID,
+              replyStates[conversation]?.lastPlayedID != reply.id else { return false }
+        var state = replyStates[conversation] ?? DialogueReplyState()
+        state.lastPlayedID = reply.id; replyStates[conversation] = state
+        do { try persist() } catch { notice = error.localizedDescription }
+        return true
+    }
+    func markResponded(to reply: DialogueReply, for jobID: UUID) {
+        guard let conversation = jobs.first(where:{$0.id == jobID})?.conversationID else { return }
+        var state = replyStates[conversation] ?? DialogueReplyState()
+        state.lastRespondedID = reply.id; replyStates[conversation] = state
+        do { try persist() } catch { notice = error.localizedDescription }
+    }
+    func autoPlayReplyIfNeeded(_ reply: DialogueReply, for jobID: UUID) {
+        guard claimReplyPlayback(reply,for:jobID) else { return }
+        startReplyPlayback(reply,for:jobID)
+    }
     func toggleReplyPlayback(_ reply: DialogueReply, for jobID: UUID) {
         if playingReplyID == reply.id { stopReply(); return }
+        _ = claimReplyPlayback(reply,for:jobID)
+        startReplyPlayback(reply,for:jobID)
+    }
+    private func startReplyPlayback(_ reply: DialogueReply, for jobID: UUID) {
         stopReply(); playingReplyID = reply.id
         if let object = reply.audioObjectID, let job = jobs.first(where:{$0.id == jobID}), let api, allowed {
             Task {

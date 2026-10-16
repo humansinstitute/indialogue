@@ -181,18 +181,34 @@ struct RecorderView: View {
             && renameTarget == nil && deleteTarget == nil && downloadTarget == nil && !criticalNotice
         let poll = ReplyPollingKey(jobID:job.id,active:scenePhase == .active && model.active == nil && unobscured,signer:identity.npub)
         return VStack(alignment:.leading,spacing:10) {
-            HStack { Text("Conversation").font(.headline); Spacer(); Button("Refresh reply") { Task { await transfers.refreshReply(for:job.id) } } }
+            HStack { Text("Conversation").font(.headline); Spacer(); Button("Refresh reply") { Task { await transfers.refreshAndPlayReply(for:job.id) } } }
             if let conversation = job.conversationID, let reply = transfers.replies[conversation] {
-                Text(reply.sender).font(.subheadline.bold())
-                Text(reply.body).frame(maxWidth:.infinity,alignment:.leading).accessibilityIdentifier("replyText")
-                Button(transfers.playingReplyID == reply.id ? "Stop reply" : reply.audioObjectID == nil ? "Listen to reply" : "Play reply audio", systemImage:transfers.playingReplyID == reply.id ? "stop.fill" : "play.fill") {
-                    transfers.toggleReplyPlayback(reply,for:job.id)
-                }.buttonStyle(.bordered)
-                Button { if let route = transfers.followupRoute(for:job) { Task { await model.start(route:route) } } } label: {
-                    Label("Respond",systemImage:"mic.fill").font(.title3.bold()).frame(maxWidth:.infinity).padding(.vertical,8)
-                }.buttonStyle(.borderedProminent).accessibilityIdentifier("respondButton")
+                let responded = transfers.replyStates[conversation]?.lastRespondedID == reply.id
+                if responded {
+                    Label("Responded",systemImage:"checkmark.circle.fill").font(.title2.bold()).foregroundStyle(.green)
+                    HStack { ProgressView(); Text("Waiting for the next reply") }.font(.headline)
+                } else {
+                    Label("New reply from \(reply.sender)",systemImage:"message.fill").font(.headline).foregroundStyle(.green)
+                    Button(transfers.playingReplyID == reply.id ? "Stop reply" : reply.audioObjectID == nil ? "Listen to reply" : "Play reply audio", systemImage:transfers.playingReplyID == reply.id ? "stop.fill" : "play.fill") {
+                        transfers.toggleReplyPlayback(reply,for:job.id)
+                    }.buttonStyle(.bordered).controlSize(.large).frame(maxWidth:.infinity)
+                    DisclosureGroup("Show reply text") {
+                        Text(reply.body).frame(maxWidth:.infinity,alignment:.leading).accessibilityIdentifier("replyText")
+                    }
+                    Button {
+                        if let route = transfers.followupRoute(for:job) {
+                            Task {
+                                await model.start(route:route)
+                                if model.active != nil { transfers.markResponded(to:reply,for:job.id) }
+                            }
+                        }
+                    } label: {
+                        Label("Respond",systemImage:"mic.fill").font(.title2.bold()).frame(maxWidth:.infinity).padding(.vertical,12)
+                    }.buttonStyle(.borderedProminent).controlSize(.large).accessibilityIdentifier("respondButton")
+                }
             } else {
-                Text(transfers.replyNotice ?? "Sent. Checking automatically; Refresh reply remains available.").font(.footnote).foregroundStyle(.secondary)
+                HStack { ProgressView(); Text("Sent · waiting for a reply") }.font(.headline)
+                Text(transfers.replyNotice ?? "Checking automatically; Refresh reply remains available.").font(.footnote).foregroundStyle(.secondary)
             }
         }.padding().background(.thinMaterial,in:RoundedRectangle(cornerRadius:16)).accessibilityElement(children:.contain)
             .task(id:poll) {
