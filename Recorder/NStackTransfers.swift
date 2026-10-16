@@ -3,6 +3,7 @@ import CryptoKit
 import SwiftUI
 import CoreFoundation
 import AVFoundation
+import UIKit
 
 /// Storage APIs serialize bigint byte counts as either JSON integers or decimal strings.
 enum StorageMetadata {
@@ -41,6 +42,11 @@ struct TransferFile: Codable, Equatable {
     var uploadURL: String?
     var preparing = false
     var complete = false
+    /// A successful PUT delegate callback is durable separately from storage completion/readback.
+    /// Optional preserves decoding of build 11 ledgers.
+    var putCompleted: Bool?
+    var backgroundTaskID: Int?
+    var backgroundTaskDescription: String?
 }
 struct TransferJob: Codable, Identifiable, Equatable {
     var id = UUID()
@@ -94,6 +100,10 @@ final class NStackTransfers: ObservableObject {
     private var allowed = false
     private var currentSigner: String?
     private var api: NStackAPI?
+    private var reconcilingBackgroundTasks = false
+    private var missingBackgroundTasks = Set<String>()
+    private var backgrounded = false
+    private var backgroundExecution: UIBackgroundTaskIdentifier = .invalid
     private(set) var replyRefreshJobID: UUID?
     private var replyPlayer: AVAudioPlayer?
     private let speech = AVSpeechSynthesizer()
@@ -255,35 +265,76 @@ final class NStackTransfers: ObservableObject {
     }
     func setAvailability(active: Bool, signer: String?, api: NStackAPI) {
         self.api = api; currentSigner = signer; allowed = active && signer != nil
+        api.backgroundUploads.onEvents = { [weak self] in
+            guard let self else { return }
+            Task { @MainActor in await self.reconcileBackgroundTransfers() }
+        }
         if !allowed { worker?.cancel(); stopReply() }
-        for i in jobs.indices where !["sent","cancelled","failed"].contains(jobs[i].state) {
+        for i in jobs.indices where !["sent","cancelled","failed","background_uploading"].contains(jobs[i].state) {
             if !active { jobs[i].state = "paused_capture_or_background" }
             else if signer == nil { jobs[i].state = "paused_locked" }
             else if signer != jobs[i].destination.signer { jobs[i].state = "paused_identity" }
             else { jobs[i].state = "queued" }
         }
-        do { try persist() } catch { notice = error.localizedDescription }; resume()
+        do { try persist() } catch { notice = error.localizedDescription }
+        Task { await reconcileBackgroundTransfers() }
+        resume()
+    }
+    func enterBackground() {
+        backgrounded = true
+        stopReply()
+        if worker != nil { beginBackgroundExecution() }
+    }
+    private func beginBackgroundExecution() {
+        guard backgroundExecution == .invalid else { return }
+        backgroundExecution = UIApplication.shared.beginBackgroundTask(withName:"Finish recording delivery") { [weak self] in
+            Task { @MainActor in self?.backgroundExecutionExpired() }
+        }
+    }
+    func enterForeground() {
+        backgrounded = false
+        endBackgroundExecution()
+        resume()
+    }
+    func backgroundExecutionExpired() {
+        guard backgroundExecution != .invalid || backgrounded else { return }
+        worker?.cancel()
+        endBackgroundExecution()
+    }
+    private func endBackgroundExecution() {
+        guard backgroundExecution != .invalid else { return }
+        UIApplication.shared.endBackgroundTask(backgroundExecution)
+        backgroundExecution = .invalid
     }
     func retry(_ id: UUID) {
         guard let i = jobs.firstIndex(where: { $0.id == id }), jobs[i].state != "sent", jobs[i].state != "cancelled" else { return }
+        if jobs[i].state == "failed" {
+            for file in jobs[i].files.indices where jobs[i].files[file].backgroundTaskID != nil {
+                jobs[i].files[file].backgroundTaskID = nil
+                jobs[i].files[file].backgroundTaskDescription = nil
+            }
+        }
         jobs[i].state = currentSigner == nil ? "paused_locked" : currentSigner != jobs[i].destination.signer ? "paused_identity" : !allowed ? "paused_capture_or_background" : "queued"; jobs[i].notice = nil
         do { try persist() } catch { notice = error.localizedDescription }; resume()
     }
     func cancel(_ id: UUID) {
         guard let i = jobs.firstIndex(where: { $0.id == id }), jobs[i].state != "sent" else { return }
-        worker?.cancel(); jobs[i].state = "cancelled"; jobs[i].notice = "Local cancellation retains files. It cannot retract an already committed remote message."
+        worker?.cancel()
+        if let api { for task in jobs[i].files.compactMap(\.backgroundTaskID) { api.backgroundUploads.cancel(task) } }
+        jobs[i].state = "cancelled"; jobs[i].notice = "Local cancellation retains files. It cannot retract an already committed remote message."
         do { try persist() } catch { notice = error.localizedDescription }
     }
     func resume() {
         guard readable, allowed, worker == nil, jobs.contains(where: { $0.state == "queued" && $0.destination.signer == currentSigner }), let api else { return }
+        if backgrounded { beginBackgroundExecution() }
         worker = Task {
-            defer { worker = nil; onIdle?(); if allowed { resume() } }
+            defer { worker = nil; onIdle?(); if backgrounded { endBackgroundExecution() }; if allowed { resume() } }
             while let i = jobs.firstIndex(where: { $0.state == "queued" && $0.destination.signer == currentSigner }), allowed, !Task.isCancelled {
                 do { try await send(i, api:api) }
                 catch {
                     if jobs[i].state != "cancelled" {
-                        jobs[i].state = Task.isCancelled ? (currentSigner == nil ? "paused_locked" : "queued") : "failed"
-                        jobs[i].notice = Task.isCancelled ? "Deferred until foreground, idle capture and identity unlock." : error.localizedDescription
+                        jobs[i].state = Task.isCancelled ? (currentSigner == nil ? "paused_locked" : allowed ? "queued" : "paused_capture_or_background") : "failed"
+                        jobs[i].notice = Task.isCancelled ? "Finalization was interrupted and will resume safely when execution is available." : error.localizedDescription
                     }
                     do { try persist() } catch { notice = error.localizedDescription }
                     if Task.isCancelled { break }
@@ -312,7 +363,23 @@ final class NStackTransfers: ObservableObject {
             if try StorageMetadata.isCompleted(metadata) {
                 try StorageMetadata.validateCompleted(metadata, file: file)
             } else {
-                try await api.putFile(path,upload:jobs[i].files[f].uploadURL!,origin:d.origin,object:object,mime:file.mime,size:file.size)
+                if jobs[i].files[f].putCompleted != true {
+                    if jobs[i].files[f].backgroundTaskID != nil {
+                        jobs[i].state = "background_uploading"; try persist(); return
+                    }
+                    let description = Self.backgroundDescription(job:jobs[i].id,file:file.name)
+                    if let task = try await api.makeBackgroundPut(path,upload:jobs[i].files[f].uploadURL!,origin:d.origin,object:object,mime:file.mime,size:file.size,description:description) {
+                        jobs[i].files[f].backgroundTaskID = task.identifier
+                        jobs[i].files[f].backgroundTaskDescription = description
+                        jobs[i].state = "background_uploading"
+                        jobs[i].notice = "File transfer continues using iOS background delivery."
+                        try persist()
+                        api.backgroundUploads.resume(task.identifier)
+                        return
+                    }
+                    jobs[i].files[f].putCompleted = true
+                    try persist()
+                }
                 _ = try await api.request(origin:d.origin,path:"/api/v4/storage/\(object)/complete",method:"POST",body:["size_bytes":file.size,"sha256_hex":file.checksum])
                 let readback = try await api.request(origin:d.origin,path:"/api/v4/storage/\(object)")
                 try StorageMetadata.validateCompleted(readback, file: file)
@@ -330,6 +397,92 @@ final class NStackTransfers: ObservableObject {
             replyStates[conversation] = replyState
         }
         try persist()
+    }
+
+    static func backgroundDescription(job: UUID, file: String) -> String { "v1|\(job.uuidString)|\(file)" }
+
+    private func fileIndex(for event: BackgroundUploadEvent) -> (Int, Int)? {
+        for job in jobs.indices {
+            for file in jobs[job].files.indices {
+                let candidate = jobs[job].files[file]
+                if candidate.backgroundTaskID == event.identifier ||
+                    (event.description != nil && candidate.backgroundTaskDescription == event.description) {
+                    return (job,file)
+                }
+            }
+        }
+        return nil
+    }
+
+    func reconcileBackgroundTransfers() async {
+        guard !reconcilingBackgroundTasks, let api else { return }
+        reconcilingBackgroundTasks = true
+        defer { reconcilingBackgroundTasks = false }
+
+        let events = api.backgroundUploads.drainEvents()
+        var ledgerChanged = !events.isEmpty
+        for event in events {
+            guard let (job,file) = fileIndex(for:event), !["sent","cancelled"].contains(jobs[job].state) else { continue }
+            if let description = jobs[job].files[file].backgroundTaskDescription { missingBackgroundTasks.remove(description) }
+            jobs[job].files[file].backgroundTaskID = nil
+            jobs[job].files[file].backgroundTaskDescription = nil
+            if event.succeeded {
+                jobs[job].files[file].putCompleted = true
+                jobs[job].state = resumableState(for:jobs[job])
+                jobs[job].notice = jobs[job].state == "queued" ? nil : "File transfer finished; unlock the matching identity to finalize delivery."
+            } else {
+                jobs[job].state = "failed"
+                let detail = event.errorDescription ?? event.statusCode.map { "HTTP \($0)" } ?? "unknown response"
+                jobs[job].notice = "Background file transfer was interrupted (\(detail)). Retry uses the same saved object and upload URL."
+            }
+        }
+
+        let live = await api.backgroundUploads.tasks()
+        let liveIDs = Set(live.map(\.identifier))
+        let liveDescriptions = Set(live.compactMap(\.description))
+        for job in jobs.indices where jobs[job].state == "background_uploading" {
+            for file in jobs[job].files.indices {
+                guard let id = jobs[job].files[file].backgroundTaskID else { continue }
+                let description = jobs[job].files[file].backgroundTaskDescription
+                if liveIDs.contains(id) || description.map({ liveDescriptions.contains($0) }) == true {
+                    if let description { missingBackgroundTasks.remove(description) }
+                    continue
+                }
+                let key = description ?? "task:\(id)"
+                guard missingBackgroundTasks.contains(key) else {
+                    missingBackgroundTasks.insert(key)
+                    Task { @MainActor [weak self] in
+                        // Delegate callbacks and getAllTasks are delivered on independent queues.
+                        // Give a completed task's callback time to win before declaring it missing.
+                        try? await Task.sleep(for:.seconds(5))
+                        await self?.reconcileBackgroundTransfers()
+                    }
+                    continue
+                }
+                missingBackgroundTasks.remove(key)
+                jobs[job].files[file].backgroundTaskID = nil
+                jobs[job].files[file].backgroundTaskDescription = nil
+                jobs[job].state = "failed"
+                jobs[job].notice = "The saved background transfer is no longer registered with iOS. Retry uses the same object and upload URL; no new object was created."
+                ledgerChanged = true
+            }
+        }
+        if ledgerChanged {
+            do { try persist() }
+            catch {
+                notice = error.localizedDescription
+                api.backgroundUploads.requeueEvents(events)
+                return
+            }
+        }
+        api.backgroundUploads.reconciliationDrained()
+        resume()
+    }
+
+    private func resumableState(for job: TransferJob) -> String {
+        if currentSigner == nil { return "paused_locked" }
+        if currentSigner != job.destination.signer { return "paused_identity" }
+        return allowed ? "queued" : "paused_capture_or_background"
     }
 
     static let replyPollInterval: Duration = .seconds(20)

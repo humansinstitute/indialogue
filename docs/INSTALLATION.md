@@ -43,12 +43,14 @@ Build 9 filtered every live Tower message row because JSON `deleted_at: null` wa
 
 Version 1.3 **build 11** checks immediately and then every 20 seconds for replies while the latest sent conversation is visible, foregrounded and unlocked; it stops outside that lifecycle and keeps manual Refresh Reply. Each new reply auto-plays once and retains large manual Listen/Stop and Respond controls. After response capture it shows pending/sending (or a retryable failure); green Responded/waiting appears only after Tower accepts the same-thread follow-up. New Channel/Agent setup reuses a valid Tower identity and workspace from the installation, without rewriting saved routes or captured conversations. Update in place and verify automatic arrival/playback, background/foreground deduplication, pending-to-sent response state, failure recovery, and route-specific setup before wider use.
 
+Version 1.3 **build 12** moves presigned recording-file PUTs into the app's named iOS background URL session. Update in place with the existing bundle ID/team. Begin a delivery, lock or background the phone, and confirm the transfer can finish without reopening; then verify exactly one private object completion and one message after signed finalization. Repeat with network loss and a locked identity. iOS schedules background transfers and may delay them. Signed finalization can wait for foreground/PIN, and force-quit can cancel transfer/relaunch behavior; reopen the app and use Retry on the same snapshot if that occurs.
+
 ## TestFlight release
 
 Use the existing Apple Distribution identity, team and App Store Connect app for `studio.otherstuff.PeteRecorder`; never create a replacement bundle ID or uninstall the phone app. After the reviewed commit passes the complete test suite and generic device build:
 
-1. In Xcode, select Any iOS Device (arm64), Product → Archive, and confirm the archive is version 1.3 build 11.
+1. In Xcode, select Any iOS Device (arm64), Product → Archive, and confirm the archive is version 1.3 build 12.
 2. Organizer → Distribute App → App Store Connect → Upload. Keep automatic signing only if it resolves the existing App Store distribution profile; do not switch teams.
-3. Wait for App Store Connect processing, confirm build 11 appears under TestFlight, then add it to the existing private internal tester group. Apple agreements, export-compliance questions or interactive approval remain owner actions.
+3. Wait for App Store Connect processing, confirm build 12 appears under TestFlight, then add it to the existing private internal tester group. Apple agreements, export-compliance questions or interactive approval remain owner actions.
 
 For unattended release, an App Store Connect API key may authenticate `xcodebuild -exportArchive`/upload, but its private key, key ID, issuer ID, team ID, profile UUIDs and raw logs must stay outside this repository under ignored operational evidence. A successful archive is not TestFlight availability: record upload success and App Store Connect build readback. If an App Store provisioning profile cannot be resolved, stop after the archive and report that exact profile/App Store Connect action; do not use a development or wildcard profile for TestFlight.

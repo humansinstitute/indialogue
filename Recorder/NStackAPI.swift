@@ -92,8 +92,10 @@ final class NStackAPI {
     typealias Sign = (Int, [[String]], String) throws -> NostrEvent
     let sign: Sign
     let session: URLSession
-    init(session: URLSession? = nil, sign: @escaping Sign) {
+    let backgroundUploads: BackgroundUploadClient
+    init(session: URLSession? = nil, backgroundUploads: BackgroundUploadClient? = nil, sign: @escaping Sign) {
         self.sign = sign
+        self.backgroundUploads = backgroundUploads ?? BackgroundUploadCoordinator.shared
         let config = URLSessionConfiguration.ephemeral; config.timeoutIntervalForRequest = 45
         self.session = session ?? URLSession(configuration: config, delegate: RefuseRedirects(), delegateQueue: nil)
     }
@@ -151,6 +153,21 @@ final class NStackAPI {
         let (_, response) = try await session.upload(for: request, fromFile: file)
         try Task.checkCancellation()
         guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode) else { throw NStackError.response((response as? HTTPURLResponse)?.statusCode ?? 0) }
+    }
+    /// The signed API fallback remains a bounded in-process operation. A presigned HTTPS PUT
+    /// becomes a suspended background task so its ledger mapping can be persisted first.
+    func makeBackgroundPut(_ file: URL, upload: String, origin: String, object: String,
+                           mime: String, size: Int, description: String) async throws -> BackgroundUploadTask? {
+        guard let url = URL(string:upload), url.user == nil, url.password == nil, url.fragment == nil else { throw NStackError.unsafeURL }
+        let local = try Self.url(origin,"/api/v4/storage/\(object)")
+        if url.path == local.path && url.host == local.host && url.query == nil && ["https","http"].contains(url.scheme ?? "") {
+            guard size <= 8 * 1024 * 1024 else { throw NStackError.fallbackLimit }
+            _ = try await request(origin:origin,path:local.path,method:"PUT",body:["base64_data":try Data(contentsOf:file).base64EncodedString()])
+            return nil
+        }
+        guard url.scheme == "https", !url.path.hasPrefix("/api/v4/") else { throw NStackError.unsafeURL }
+        var request = URLRequest(url:url); request.httpMethod = "PUT"; request.setValue(mime,forHTTPHeaderField:"Content-Type")
+        return try backgroundUploads.makeUpload(request:request,file:file,description:description)
     }
     func message(_ job: TransferJob) throws -> [String: Any] {
         let d = job.destination; let hash = NostrCodec.hash(Data(job.body.utf8))

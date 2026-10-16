@@ -3,6 +3,7 @@ import UIKit
 
 @main
 struct PeteRecorderApp: App {
+    @UIApplicationDelegateAdaptor(RecorderAppDelegate.self) private var appDelegate
     @StateObject private var model: RecorderModel
     @StateObject private var identity: IdentityModel
     init() {
@@ -137,7 +138,7 @@ struct RecorderView: View {
                 }
                 .onChange(of: scenePhase) { _, phase in
                     if phase == .active { model.foreground(); requestUnlock() }
-                    else if phase == .background { unlockOpen = false; unlockPolicy.background(); model.background() }
+                    else if phase == .background { unlockOpen = false; unlockPolicy.background(); model.background(); transfers.enterBackground() }
                 }
                 .onChange(of: model.message) { _, value in if value != nil { criticalNotice = true } }
                 .alert("Recorder notice", isPresented: $criticalNotice) {
@@ -239,7 +240,8 @@ struct RecorderView: View {
         if unlockPolicy.request(active: scenePhase == .active, exists: identity.exists, unlocked: identity.unlocked) { unlockOpen = true }
     }
     func refreshTransfers() {
-        transfers.setAvailability(active:scenePhase == .active && model.active == nil, signer:identity.npub, api:NStackAPI { try identity.sign(kind:$0,tags:$1,content:$2) })
+        if scenePhase == .active { transfers.enterForeground() }
+        transfers.setAvailability(active:model.active == nil, signer:identity.npub, api:NStackAPI { try identity.sign(kind:$0,tags:$1,content:$2) })
     }
     var microphones: some View {
         NavigationStack {
