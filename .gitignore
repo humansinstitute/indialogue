@@ -1,13 +1,98 @@
-tmp/
-build/
+# Operational evidence and private handoffs
+/tmp/
+
+# macOS and editor state
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+*~
+*.swp
+*.swo
+.idea/
+.vscode/
+
+# Xcode and Swift build/user state
 DerivedData/
+.build/
+build/
+build-*/
+*.xcarchive/
+*.xcresult/
+*.dSYM/
+*.dSYM.zip
+*.app/
+*.ipa
 *.xcuserstate
 xcuserdata/
-.DS_Store
+*.xccheckout
+*.xcscmblueprint
+*.moved-aside
+ExportOptions*.plist
 
-build-signed/
-build-device/
+# Android/Gradle build and machine-local configuration
+.gradle/
+.kotlin/
+.externalNativeBuild/
+.cxx/
+captures/
+local.properties
+*.apk
+*.aab
+mapping.txt
 
-build-signed/
+# Local environment and service configuration
+.env
+.env.*
+!.env.example
+!.env.*.example
+*.local
 
-build-v2/
+# Logs, diagnostics, databases and coverage output
+*.log
+*.trace
+*.profraw
+*.profdata
+*.db
+*.db-*
+*.sqlite
+*.sqlite3
+*.realm
+*.xccoverage
+
+# Signing material and credentials
+*.p8
+*.p12
+*.pfx
+*.pem
+*.key
+*.cer
+*.crt
+*.der
+*.mobileprovision
+*.provisionprofile
+*.jks
+*.keystore
+
+# Archives, result bundles and generated packages
+*.zip
+*.tar
+*.tar.gz
+*.tgz
+*.gz
+
+# Recordings and operational media must be explicitly reviewed before tracking
+*.m4a
+*.wav
+*.aac
+*.caf
+*.mp3
+*.mp4
+*.mov
+*.webm
+recordings/
+transcripts/
+screenshots/
+
+# Public, generated speech fixture used only by Android instrumentation tests
+!android/app/src/androidTest/assets/synthetic-speech.m4a
