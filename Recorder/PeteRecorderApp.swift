@@ -183,10 +183,20 @@ struct RecorderView: View {
         return VStack(alignment:.leading,spacing:10) {
             HStack { Text("Conversation").font(.headline); Spacer(); Button("Refresh reply") { Task { await transfers.refreshAndPlayReply(for:job.id) } } }
             if let conversation = job.conversationID, let reply = transfers.replies[conversation] {
-                let responded = transfers.replyStates[conversation]?.lastRespondedID == reply.id
-                if responded {
+                let responseStatus = transfers.responseStatus(to:reply,for:job.id)
+                if responseStatus == .sent {
                     Label("Responded",systemImage:"checkmark.circle.fill").font(.title2.bold()).foregroundStyle(.green)
                     HStack { ProgressView(); Text("Waiting for the next reply") }.font(.headline)
+                } else if responseStatus == .sending {
+                    HStack { ProgressView(); Text("Sending response") }.font(.title2.bold())
+                } else if responseStatus == .pending {
+                    Label("Response pending",systemImage:"clock.fill").font(.title2.bold()).foregroundStyle(.orange)
+                    Text("Preparing the recording to send").font(.footnote).foregroundStyle(.secondary)
+                } else if case .failed(let notice) = responseStatus {
+                    Label("Response not sent",systemImage:"exclamationmark.triangle.fill").font(.title2.bold()).foregroundStyle(.red)
+                    if let notice { Text(notice).font(.footnote).foregroundStyle(.secondary) }
+                    Button("Retry sending",systemImage:"arrow.clockwise") { transfers.retryResponse(to:reply,for:job.id) }
+                        .buttonStyle(.borderedProminent).controlSize(.large).frame(maxWidth:.infinity)
                 } else {
                     Label("New reply from \(reply.sender)",systemImage:"message.fill").font(.headline).foregroundStyle(.green)
                     Button(transfers.playingReplyID == reply.id ? "Stop reply" : reply.audioObjectID == nil ? "Listen to reply" : "Play reply audio", systemImage:transfers.playingReplyID == reply.id ? "stop.fill" : "play.fill") {
@@ -198,8 +208,9 @@ struct RecorderView: View {
                     Button {
                         if let route = transfers.followupRoute(for:job) {
                             Task {
-                                await model.start(route:route)
-                                if model.active != nil { transfers.markResponded(to:reply,for:job.id) }
+                                var responseRoute = route
+                                responseRoute.respondingToReplyID = reply.id
+                                await model.start(route:responseRoute)
                             }
                         }
                     } label: {

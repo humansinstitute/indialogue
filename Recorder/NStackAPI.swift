@@ -52,6 +52,8 @@ struct DialogueRouteSnapshot: Codable, Equatable {
     var mode: DialogueMode
     var destination: NStackDestination
     var threadID: String?
+    /// The reply this capture answers. It is local lifecycle metadata and is not sent to Tower.
+    var respondingToReplyID: String?
 }
 
 struct DialogueReply: Identifiable, Equatable {

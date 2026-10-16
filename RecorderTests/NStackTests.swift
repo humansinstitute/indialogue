@@ -305,12 +305,66 @@ extension NStackTests {
         XCTAssertFalse(restored.storeReply(same,for:conversation), "The same reply is not presented twice")
         XCTAssertTrue(restored.claimReplyPlayback(same,for:jobID))
         XCTAssertFalse(restored.claimReplyPlayback(same,for:jobID), "Auto-play is claimed only once")
-        restored.markResponded(to:same,for:jobID)
         let restarted = NStackTransfers(root:root)
         let state = try XCTUnwrap(restarted.replyStates[conversation])
-        XCTAssertEqual(state.lastPlayedID,same.id); XCTAssertEqual(state.lastRespondedID,same.id)
+        XCTAssertEqual(state.lastPlayedID,same.id); XCTAssertNil(state.lastRespondedID)
         try restarted.deleteFinishedLocalArtifacts(ledger.jobs[0].recordingID)
         XCTAssertNil(NStackTransfers(root:root).replyStates[conversation], "Finished local cleanup removes reply round metadata")
+    }
+
+    func testResponseIsPendingOrSendingUntilSameThreadPostSucceeds() async throws {
+        let root = temp(); defer { try? FileManager.default.removeItem(at:root) }
+        let queue = NStackTransfers(root:root), audio = root.appendingPathComponent("audio")
+        try Data([1]).write(to:audio)
+        try queue.enqueue(record(),route:DialogueRouteSnapshot(mode:.agent,destination:destination(),threadID:nil),audio:audio,corrected:"First")
+        var ledger = NStackTransfers.Ledger(jobs:queue.jobs,intents:[],destination:nil)
+        ledger.jobs[0].state = "sent"; ledger.jobs[0].messageID = "mine"; ledger.jobs[0].threadID = UUID().uuidString
+        try JSONEncoder().encode(ledger).write(to:root.appendingPathComponent("ledger.json"))
+
+        let prepared = NStackTransfers(root:root), parentID = ledger.jobs[0].id
+        let conversation = try XCTUnwrap(ledger.jobs[0].conversationID)
+        let reply = DialogueReply(id:"reply-to-answer",body:"Answer",sender:"Rick",createdAt:nil,audioObjectID:nil)
+        XCTAssertTrue(prepared.storeReply(reply,for:conversation))
+        var responseRoute = try XCTUnwrap(prepared.followupRoute(for:ledger.jobs[0]))
+        responseRoute.respondingToReplyID = reply.id
+        var response = record(); response.title = "Response"; response.dialogueRoute = responseRoute
+        prepared.rememberNew(response)
+        XCTAssertEqual(prepared.responseStatus(to:reply,for:parentID),.pending)
+        XCTAssertNil(prepared.replyStates[conversation]?.lastRespondedID)
+
+        try prepared.enqueue(response,route:responseRoute,audio:audio,corrected:"Follow up")
+        XCTAssertEqual(prepared.responseStatus(to:reply,for:parentID),.pending)
+        var deliveryLedger = NStackTransfers.Ledger(jobs:prepared.jobs,intents:prepared.intents,destination:nil,replyStates:prepared.replyStates)
+        let responseIndex = try XCTUnwrap(deliveryLedger.jobs.firstIndex(where:{$0.recordingID == response.id}))
+        deliveryLedger.jobs[responseIndex].state = "queued"
+        for fileIndex in deliveryLedger.jobs[responseIndex].files.indices {
+            deliveryLedger.jobs[responseIndex].files[fileIndex].objectID = UUID().uuidString
+            deliveryLedger.jobs[responseIndex].files[fileIndex].complete = true
+        }
+        try JSONEncoder().encode(deliveryLedger).write(to:root.appendingPathComponent("ledger.json"))
+
+        let delivery = NStackTransfers(root:root)
+        MockNStackProtocol.handler = { _ in (500,["error":"not sent"]) }
+        delivery.setAvailability(active:true,signer:npub,api:api())
+        for _ in 0..<200 where delivery.jobs[responseIndex].state != "failed" { try await Task.sleep(for:.milliseconds(10)) }
+        if case .failed = delivery.responseStatus(to:reply,for:parentID) {} else { XCTFail("A rejected post must remain visibly unsent") }
+        XCTAssertNil(delivery.replyStates[conversation]?.lastRespondedID)
+
+        let releasePost = DispatchSemaphore(value:0)
+        MockNStackProtocol.handler = { request in
+            XCTAssertTrue(request.url!.path.hasSuffix("/messages"))
+            _ = releasePost.wait(timeout:.now() + 5)
+            return (201,["message":["id":"accepted-follow-up","thread_id":ledger.jobs[0].threadID!]])
+        }
+        delivery.retry(delivery.jobs[responseIndex].id)
+        for _ in 0..<200 where delivery.jobs[responseIndex].state != "posting" { try await Task.sleep(for:.milliseconds(10)) }
+        XCTAssertEqual(delivery.responseStatus(to:reply,for:parentID),.sending)
+        XCTAssertNil(delivery.replyStates[conversation]?.lastRespondedID,"Posting is not a successful response")
+        releasePost.signal()
+        for _ in 0..<200 where delivery.jobs[responseIndex].state != "sent" { try await Task.sleep(for:.milliseconds(10)) }
+        XCTAssertEqual(delivery.responseStatus(to:reply,for:parentID),.sent)
+        XCTAssertEqual(delivery.replyStates[conversation]?.lastRespondedID,reply.id)
+        XCTAssertEqual(NStackTransfers(root:root).replyStates[conversation]?.lastRespondedID,reply.id,"Successful response state survives restart")
     }
 
     func testLegacyNormalSetupSeedsNewModesWithoutPersistingOrRetargeting() throws {

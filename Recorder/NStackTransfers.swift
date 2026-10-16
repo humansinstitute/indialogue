@@ -58,6 +58,7 @@ struct TransferJob: Codable, Identifiable, Equatable {
     var threadID: String?
     var conversationID: UUID?
     var dialogueMode: DialogueMode?
+    var respondingToReplyID: String?
 }
 struct AutomaticUploadIntent: Codable {
     let recordingID: UUID
@@ -68,6 +69,12 @@ struct AutomaticUploadIntent: Codable {
 struct DialogueReplyState: Codable, Equatable {
     var lastPlayedID: String?
     var lastRespondedID: String?
+}
+enum DialogueResponseStatus: Equatable {
+    case pending
+    case sending
+    case failed(String?)
+    case sent
 }
 /// Independent of views. Atomic ledger contains no secret or Authorization headers.
 @MainActor
@@ -238,7 +245,7 @@ final class NStackTransfers: ObservableObject {
         let transcript = try NostrCodec.json(artifact); try transcript.write(to: directory.appendingPathComponent("transcript.json"), options: .atomic)
         let mention = d.recipient.map { "@[\(d.recipientLabel!)](mention:agent:\($0))\n\n" } ?? ""
         let body = (mention + d.prompt + "\n\n" + r.title + "\n\n" + String(corrected.prefix(4000)) + "\n\nFull corrected transcript and audio attached.").trimmingCharacters(in: .whitespacesAndNewlines)
-        jobs.append(TransferJob(id:id,recordingID:r.id,destination:d,title:r.title.isEmpty ? "Recording" : r.title,body:body,files:[TransferFile(name:"recording.m4a",mime:"audio/mp4",size:size,checksum:hash),TransferFile(name:"transcript.json",mime:"application/json",size:transcript.count,checksum:NostrCodec.hash(transcript))],threadID:route.threadID,conversationID:route.conversationID,dialogueMode:route.mode))
+        jobs.append(TransferJob(id:id,recordingID:r.id,destination:d,title:r.title.isEmpty ? "Recording" : r.title,body:body,files:[TransferFile(name:"recording.m4a",mime:"audio/mp4",size:size,checksum:hash),TransferFile(name:"transcript.json",mime:"application/json",size:transcript.count,checksum:NostrCodec.hash(transcript))],threadID:route.threadID,conversationID:route.conversationID,dialogueMode:route.mode,respondingToReplyID:route.respondingToReplyID))
         let last = jobs.count - 1
         if currentSigner == nil { jobs[last].state = "paused_locked"; jobs[last].notice = "Unlock identity while the app is active to send." }
         else if currentSigner != d.signer { jobs[last].state = "paused_identity" }
@@ -316,7 +323,13 @@ final class NStackTransfers: ObservableObject {
         let response = try await api.request(origin:d.origin,path:"/api/v4/flightdeck-pg/workspaces/\(d.workspace)/channels/\(d.channel)/messages",app:d.appNpub,method:"POST",body:api.message(jobs[i]))
         guard let message = response["message"] as? [String:Any], let id = message["id"] as? String else { throw NStackError.malformed }
         jobs[i].messageID = id; jobs[i].threadID = (response["thread"] as? [String:Any])?["id"] as? String ?? message["thread_id"] as? String
-        jobs[i].state = "sent"; jobs[i].notice = nil; try persist()
+        jobs[i].state = "sent"; jobs[i].notice = nil
+        if let conversation = jobs[i].conversationID, let replyID = jobs[i].respondingToReplyID {
+            var replyState = replyStates[conversation] ?? DialogueReplyState()
+            replyState.lastRespondedID = replyID
+            replyStates[conversation] = replyState
+        }
+        try persist()
     }
 
     static let replyPollInterval: Duration = .seconds(20)
@@ -417,11 +430,30 @@ final class NStackTransfers: ObservableObject {
         do { try persist() } catch { notice = error.localizedDescription }
         return true
     }
-    func markResponded(to reply: DialogueReply, for jobID: UUID) {
-        guard let conversation = jobs.first(where:{$0.id == jobID})?.conversationID else { return }
-        var state = replyStates[conversation] ?? DialogueReplyState()
-        state.lastRespondedID = reply.id; replyStates[conversation] = state
-        do { try persist() } catch { notice = error.localizedDescription }
+    func responseStatus(to reply: DialogueReply, for jobID: UUID) -> DialogueResponseStatus? {
+        guard let conversation = jobs.first(where:{$0.id == jobID})?.conversationID else { return nil }
+        if replyStates[conversation]?.lastRespondedID == reply.id { return .sent }
+        if let response = jobs.reversed().first(where: {
+            $0.conversationID == conversation && $0.respondingToReplyID == reply.id && $0.state != "cancelled"
+        }) {
+            switch response.state {
+            case "sent": return .sent
+            case "uploading", "posting": return .sending
+            case "failed": return .failed(response.notice)
+            default: return .pending
+            }
+        }
+        if intents.contains(where: {
+            $0.route?.conversationID == conversation && $0.route?.respondingToReplyID == reply.id
+        }) { return .pending }
+        return nil
+    }
+    func retryResponse(to reply: DialogueReply, for jobID: UUID) {
+        guard let conversation = jobs.first(where:{$0.id == jobID})?.conversationID,
+              let response = jobs.reversed().first(where: {
+                  $0.conversationID == conversation && $0.respondingToReplyID == reply.id && $0.state == "failed"
+              }) else { return }
+        retry(response.id)
     }
     func autoPlayReplyIfNeeded(_ reply: DialogueReply, for jobID: UUID) {
         guard claimReplyPlayback(reply,for:jobID) else { return }
