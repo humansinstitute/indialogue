@@ -266,6 +266,67 @@ extension NStackTests {
         await restored.refreshReply(for:restored.jobs[0].id)
         XCTAssertEqual(restored.replyNotice,NStackError.malformed.localizedDescription)
     }
+
+    func testReplyPollingImmediateStopResumeOverlapAndDeduplication() async throws {
+        let root = temp(); defer { try? FileManager.default.removeItem(at:root) }
+        let queue = NStackTransfers(root:root), audio = root.appendingPathComponent("audio")
+        try Data([1]).write(to:audio)
+        try queue.enqueue(record(),route:DialogueRouteSnapshot(mode:.agent,destination:destination(),threadID:nil),audio:audio,corrected:"First")
+        var ledger = NStackTransfers.Ledger(jobs:queue.jobs,intents:[],destination:nil)
+        ledger.jobs[0].state = "sent"; ledger.jobs[0].messageID = "mine"; ledger.jobs[0].threadID = UUID().uuidString
+        try JSONEncoder().encode(ledger).write(to:root.appendingPathComponent("ledger.json"))
+        let restored = NStackTransfers(root:root), jobID = ledger.jobs[0].id
+        let conversation = try XCTUnwrap(ledger.jobs[0].conversationID)
+        var calls = 0
+        MockNStackProtocol.handler = { _ in
+            calls += 1
+            return (200,["messages":[["id":"one-reply","body":"Answer","record_state":"active","deleted_at":NSNull()]],"next_cursor":NSNull()])
+        }
+        restored.setAvailability(active:true,signer:npub,api:api())
+        var delays = 0
+        await restored.pollReplies(for:jobID) { duration in
+            XCTAssertEqual(duration,NStackTransfers.replyPollInterval)
+            delays += 1
+            restored.setAvailability(active:false,signer:nil,api:self.api())
+        }
+        XCTAssertEqual(calls,1); XCTAssertEqual(delays,1)
+        XCTAssertEqual(restored.replies[conversation]?.id,"one-reply")
+
+        restored.setAvailability(active:true,signer:npub,api:api())
+        await restored.pollReplies(for:jobID) { _ in throw CancellationError() }
+        XCTAssertEqual(calls,2, "Resuming starts with another immediate check")
+
+        let another = UUID()
+        XCTAssertTrue(restored.beginReplyRefresh(for:jobID))
+        XCTAssertFalse(restored.beginReplyRefresh(for:another), "Manual and automatic reads cannot overlap")
+        restored.finishReplyRefresh(for:another); XCTAssertEqual(restored.replyRefreshJobID,jobID)
+        restored.finishReplyRefresh(for:jobID); XCTAssertNil(restored.replyRefreshJobID)
+        let same = try XCTUnwrap(restored.replies[conversation])
+        XCTAssertFalse(restored.storeReply(same,for:conversation), "The same reply is not presented twice")
+    }
+
+    func testLegacyNormalSetupSeedsNewModesWithoutPersistingOrRetargeting() throws {
+        let root = temp(); defer { try? FileManager.default.removeItem(at:root) }
+        try FileManager.default.createDirectory(at:root,withIntermediateDirectories:true)
+        let normal = destination()
+        let encoded = try JSONSerialization.jsonObject(with:JSONEncoder().encode(normal))
+        let legacy:[String:Any] = ["jobs":[],"intents":[],"destination":encoded]
+        try NostrCodec.json(legacy).write(to:root.appendingPathComponent("ledger.json"),options:.atomic)
+
+        let restored = NStackTransfers(root:root)
+        let channel = try XCTUnwrap(restored.setupSeed(for:.channel,signer:npub))
+        XCTAssertEqual(channel.destination,normal); XCTAssertFalse(channel.saved)
+        let agent = try XCTUnwrap(restored.setupSeed(for:.agent,signer:npub))
+        XCTAssertEqual(agent.destination.workspace,normal.workspace); XCTAssertFalse(agent.saved)
+        XCTAssertNil(restored.routing.channel); XCTAssertNil(restored.routing.agent)
+        XCTAssertNil(restored.setupSeed(for:.channel,signer:NostrCodec.npub(Data(repeating:2,count:32))))
+
+        var savedAgent = normal; savedAgent.prompt = "Existing agent route"
+        try restored.saveRoute(savedAgent,mode:.agent)
+        let existing = try XCTUnwrap(restored.setupSeed(for:.agent,signer:npub))
+        XCTAssertTrue(existing.saved); XCTAssertEqual(existing.destination,savedAgent)
+        XCTAssertEqual(NStackTransfers(root:root).routing.agent,savedAgent)
+    }
 }
 
 // Bitcoin BIP340 official test vector 0, public synthetic scalar 3.

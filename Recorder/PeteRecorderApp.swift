@@ -40,6 +40,11 @@ struct PeteRecorderApp: App {
 }
 
 struct ShareFile: Identifiable { let id = UUID(); let url: URL }
+private struct ReplyPollingKey: Hashable {
+    let jobID: UUID
+    let active: Bool
+    let signer: String?
+}
 struct RecorderView: View {
     @ObservedObject var model: RecorderModel
     @ObservedObject var transfers: NStackTransfers
@@ -107,7 +112,7 @@ struct RecorderView: View {
                     conversation(job)
                 }
                 Spacer()
-                Text("Use only when it is safe and lawful to interact with your phone. Replies refresh in the foreground and need a network connection.")
+                Text("Use only when it is safe and lawful to interact with your phone. Visible conversations check for replies every 20 seconds while the app is active and online.")
                     .font(.caption).foregroundStyle(.secondary).multilineTextAlignment(.center)
                 }.padding(24)
             }.navigationTitle("In Dialogue")
@@ -172,7 +177,10 @@ struct RecorderView: View {
         return "Channel · \(d.channelLabel)"
     }
     func conversation(_ job: TransferJob) -> some View {
-        VStack(alignment:.leading,spacing:10) {
+        let unobscured = !menuOpen && !micOpen && !routeOpen && !unlockOpen && selected == nil && share == nil
+            && renameTarget == nil && deleteTarget == nil && downloadTarget == nil && !criticalNotice
+        let poll = ReplyPollingKey(jobID:job.id,active:scenePhase == .active && model.active == nil && unobscured,signer:identity.npub)
+        return VStack(alignment:.leading,spacing:10) {
             HStack { Text("Conversation").font(.headline); Spacer(); Button("Refresh reply") { Task { await transfers.refreshReply(for:job.id) } } }
             if let conversation = job.conversationID, let reply = transfers.replies[conversation] {
                 Text(reply.sender).font(.subheadline.bold())
@@ -184,10 +192,14 @@ struct RecorderView: View {
                     Label("Respond",systemImage:"mic.fill").font(.title3.bold()).frame(maxWidth:.infinity).padding(.vertical,8)
                 }.buttonStyle(.borderedProminent).accessibilityIdentifier("respondButton")
             } else {
-                Text(transfers.replyNotice ?? "Sent. Refresh when a reply is expected.").font(.footnote).foregroundStyle(.secondary)
+                Text(transfers.replyNotice ?? "Sent. Checking automatically; Refresh reply remains available.").font(.footnote).foregroundStyle(.secondary)
             }
         }.padding().background(.thinMaterial,in:RoundedRectangle(cornerRadius:16)).accessibilityElement(children:.contain)
-            .task(id:job.id) { await transfers.refreshReply(for:job.id) }
+            .task(id:poll) {
+                guard poll.active, poll.signer == job.destination.signer else { return }
+                refreshTransfers()
+                await transfers.pollReplies(for:job.id)
+            }
     }
     func requestUnlock() {
         guard scenePhase == .active, identity.exists, !identity.unlocked, !unlockPolicy.requested else { return }

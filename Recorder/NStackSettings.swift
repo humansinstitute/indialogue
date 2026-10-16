@@ -20,6 +20,7 @@ struct NStackSettings: View {
     @State private var captureMode: DialogueMode
     @State private var loading = false
     @State private var notice: String?
+    @State private var seededOrigin: String?
     init(transfers: NStackTransfers, identity: IdentityModel) {
         self.transfers = transfers; self.identity = identity
         _captureMode = State(initialValue:transfers.routing.mode)
@@ -79,18 +80,16 @@ struct NStackSettings: View {
         }.navigationTitle("NStack")
             .onAppear {
                 guard !restored else { return }; restored = true
-                if let d = savedRoute {
-                    origin = d.origin; prompt = d.prompt; automatic = d.automatic
-                    recipient = d.recipient ?? ""; recipientLabel = d.recipientLabel ?? ""
-                    restoreSelection(d)
-                }
+                loadSetup()
             }
-            .onChange(of:captureMode) { _,_ in loadSavedRoute() }
+            .onChange(of:captureMode) { _,_ in loadSetup() }
             .onChange(of:origin) { _,_ in
+                guard origin != seededOrigin else { return }
+                seededOrigin = nil
                 reset()
                 if let d = savedRoute, d.origin == origin { restoreSelection(d) }
             }
-            .onChange(of:identity.npub) { _,_ in reset() }
+            .onChange(of:identity.npub) { _,_ in reset(); loadSetup() }
     }
     var savedRoute: NStackDestination? {
         switch captureMode {
@@ -99,11 +98,23 @@ struct NStackSettings: View {
         case .agent: transfers.routing.agent
         }
     }
-    func loadSavedRoute() {
-        guard let d = savedRoute else { return }
+    func loadSetup() {
+        guard let seed = transfers.setupSeed(for:captureMode,signer:identity.npub) else {
+            seededOrigin = ""; origin = ""; prompt = "Please review this recording."; automatic = false
+            recipient = ""; recipientLabel = ""; reset(); return
+        }
+        let d = seed.destination
+        seededOrigin = d.origin
         origin = d.origin; prompt = d.prompt; automatic = d.automatic
-        recipient = d.recipient ?? ""; recipientLabel = d.recipientLabel ?? ""
-        restoreSelection(d)
+        let keepRecipient = seed.saved || captureMode == .normal
+        recipient = keepRecipient ? d.recipient ?? "" : ""
+        recipientLabel = keepRecipient ? d.recipientLabel ?? "" : ""
+        let selections = NStackDiscovery.savedSelections(d)
+        workspaces = [selections.workspace]; workspace = selections.workspace
+        let keepChannel = seed.saved || captureMode != .channel
+        channels = keepChannel ? [selections.channel] : []; channel = keepChannel ? selections.channel : nil
+        agents = []; directoryStatus = nil; manualRecipient = false; notice = nil
+        if identity.unlocked { select(selections.workspace,preserveChannel:keepChannel,preserveRecipient:keepRecipient) }
     }
     func restoreSelection(_ d: NStackDestination) {
         let choices = NStackDiscovery.savedSelections(d)
@@ -126,8 +137,11 @@ struct NStackSettings: View {
             } catch { notice = error.localizedDescription }
         }
     }
-    func select(_ w: NStackChoice) {
-        workspace = w; agents = []; manualRecipient = false; channel = nil; channels = []; recipient = ""; recipientLabel = ""; loading = true
+    func select(_ w: NStackChoice, preserveChannel: Bool = false, preserveRecipient: Bool = false) {
+        let retainedChannel = preserveChannel ? channel : nil
+        workspace = w; agents = []; manualRecipient = false; channel = retainedChannel; channels = retainedChannel.map { [$0] } ?? []
+        if !preserveRecipient { recipient = ""; recipientLabel = "" }
+        loading = true
         let requestedOrigin = origin; let signer = identity.npub
         Task {
             defer { loading = false }
@@ -140,6 +154,8 @@ struct NStackSettings: View {
                 directoryStatus = discovery.directoryError.map { "Agent directory unavailable: " + $0 + " Retry workspace discovery or ask the workspace administrator for the canonical agent npub." }
                     ?? (agents.isEmpty ? "Agent directory loaded: no visible receiving agents are available." : "Choose a canonical receiving agent from the workspace directory.")
                 channels = discovery.channels
+                if let retainedChannel, discovery.channels.contains(where: { $0.id == retainedChannel.id }) { channel = retainedChannel }
+                else if preserveChannel { channel = nil }
                 notice = discovery.channelError ?? (channels.isEmpty ? "No accessible message channels." : discovery.labelNotice)
             } catch { if origin == requestedOrigin, identity.npub == signer, workspace?.id == w.id { agents = []; manualRecipient = true; directoryStatus = "Discovery failed. Retry selecting the workspace."; channels = []; channel = nil; notice = error.localizedDescription } }
         }

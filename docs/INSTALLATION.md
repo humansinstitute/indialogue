@@ -41,12 +41,14 @@ For the Dialogue voice loop, distribute version 1.3 **build 9**. It preserves th
 
 Build 9 filtered every live Tower message row because JSON `deleted_at: null` was mistaken for a deletion marker. Version 1.3 **build 10** fixes Reply Refresh against the typed effective-thread contract, distinguishes a genuinely empty thread from a malformed response, and leaves the saved route, signing identity, authorization and local data paths unchanged. Update in place and repeat the real reply plus two-turn Respond check before wider use.
 
+Version 1.3 **build 11** checks immediately and then every 20 seconds for replies while the latest sent conversation is visible, foregrounded and unlocked; it stops outside that lifecycle and keeps manual Refresh Reply. New Channel/Agent setup reuses a valid Tower identity and workspace from the installation, without rewriting saved routes or captured conversations. Update in place and verify automatic arrival, background/foreground resume, and route-specific setup before wider use.
+
 ## TestFlight release
 
 Use the existing Apple Distribution identity, team and App Store Connect app for `studio.otherstuff.PeteRecorder`; never create a replacement bundle ID or uninstall the phone app. After the reviewed commit passes the complete test suite and generic device build:
 
-1. In Xcode, select Any iOS Device (arm64), Product → Archive, and confirm the archive is version 1.3 build 10.
+1. In Xcode, select Any iOS Device (arm64), Product → Archive, and confirm the archive is version 1.3 build 11.
 2. Organizer → Distribute App → App Store Connect → Upload. Keep automatic signing only if it resolves the existing App Store distribution profile; do not switch teams.
-3. Wait for App Store Connect processing, confirm build 10 appears under TestFlight, then add it to the existing private internal tester group. Apple agreements, export-compliance questions or interactive approval remain owner actions.
+3. Wait for App Store Connect processing, confirm build 11 appears under TestFlight, then add it to the existing private internal tester group. Apple agreements, export-compliance questions or interactive approval remain owner actions.
 
 For unattended release, an App Store Connect API key may authenticate `xcodebuild -exportArchive`/upload, but its private key, key ID, issuer ID, team ID, profile UUIDs and raw logs must stay outside this repository under ignored operational evidence. A successful archive is not TestFlight availability: record upload success and App Store Connect build readback. If an App Store provisioning profile cannot be resolved, stop after the archive and report that exact profile/App Store Connect action; do not use a development or wildcard profile for TestFlight.

@@ -82,6 +82,7 @@ final class NStackTransfers: ObservableObject {
     private var allowed = false
     private var currentSigner: String?
     private var api: NStackAPI?
+    private(set) var replyRefreshJobID: UUID?
     private var replyPlayer: AVAudioPlayer?
     private let speech = AVSpeechSynthesizer()
     private lazy var playbackDelegate = ReplyPlaybackDelegate { [weak self] in
@@ -158,6 +159,24 @@ final class NStackTransfers: ObservableObject {
         }
         routing.mode = mode
         try persist()
+    }
+    func savedRoute(for mode: DialogueMode) -> NStackDestination? {
+        switch mode {
+        case .normal: destination
+        case .channel: routing.channel
+        case .agent: routing.agent
+        }
+    }
+    /// A new mode reuses a valid installation-level connection without mutating any saved route.
+    func setupSeed(for mode: DialogueMode, signer: String?) -> (destination: NStackDestination, saved: Bool)? {
+        if let saved = savedRoute(for:mode), saved.signer == signer, (try? saved.validate()) != nil {
+            return (saved, true)
+        }
+        for candidate in [destination, routing.channel, routing.agent].compactMap({ $0 })
+        where candidate.signer == signer && (try? candidate.validate()) != nil {
+            return (candidate, false)
+        }
+        return nil
     }
     func captureRoute() -> DialogueRouteSnapshot? {
         guard let selected = routing.destination(normal:destination) else { return nil }
@@ -289,9 +308,36 @@ final class NStackTransfers: ObservableObject {
         jobs[i].state = "sent"; jobs[i].notice = nil; try persist()
     }
 
+    static let replyPollInterval: Duration = .seconds(20)
+    typealias ReplyPollDelay = (Duration) async throws -> Void
+    func pollReplies(for jobID: UUID, interval: Duration = replyPollInterval,
+                     delay: @escaping ReplyPollDelay = { try await Task<Never, Never>.sleep(for:$0) }) async {
+        while allowed, !Task.isCancelled {
+            await refreshReply(for:jobID)
+            guard allowed, !Task.isCancelled else { return }
+            do { try await delay(interval) }
+            catch { return }
+        }
+    }
+    func beginReplyRefresh(for jobID: UUID) -> Bool {
+        guard replyRefreshJobID == nil else { return false }
+        replyRefreshJobID = jobID
+        return true
+    }
+    func finishReplyRefresh(for jobID: UUID) {
+        if replyRefreshJobID == jobID { replyRefreshJobID = nil }
+    }
+    @discardableResult func storeReply(_ reply: DialogueReply, for conversation: UUID) -> Bool {
+        guard replies[conversation]?.id != reply.id else { return false }
+        replies[conversation] = reply
+        return true
+    }
     func refreshReply(for jobID: UUID) async {
-        guard allowed, let api, let job = jobs.first(where:{$0.id == jobID}), let thread = job.threadID,
+        guard allowed, let api, let job = jobs.first(where:{$0.id == jobID}), job.state == "sent",
+              currentSigner == job.destination.signer, let thread = job.threadID,
               let conversation = job.conversationID else { replyNotice = "Replies refresh only in the foreground with the matching identity unlocked."; return }
+        guard beginReplyRefresh(for:jobID) else { return }
+        defer { finishReplyRefresh(for:jobID) }
         do {
             let base = "/api/v4/flightdeck-pg/workspaces/\(job.destination.workspace)/channels/\(job.destination.channel)/messages"
             let own = Set(jobs.filter{$0.conversationID == conversation}.compactMap(\.messageID))
@@ -315,9 +361,16 @@ final class NStackTransfers: ObservableObject {
                 }
                 cursor = result["next_cursor"] as? String
             } while cursor != nil
-            if let newest { replies[conversation] = newest; replyNotice = nil }
+            try Task.checkCancellation()
+            guard allowed, currentSigner == job.destination.signer else { return }
+            if let newest {
+                storeReply(newest,for:conversation)
+                replyNotice = nil
+            }
             else { replyNotice = "No new reply yet. Pull to refresh or tap Refresh reply while the app is in the foreground." }
-        } catch { replyNotice = error.localizedDescription }
+        } catch {
+            if !Task.isCancelled { replyNotice = error.localizedDescription }
+        }
     }
     static func reply(_ message: [String:Any]) throws -> DialogueReply? {
         if message["record_state"] as? String == "deleted" { return nil }
