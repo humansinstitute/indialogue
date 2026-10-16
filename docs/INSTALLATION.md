@@ -2,7 +2,7 @@
 
 Requires iOS 18+, Xcode 26.3 (iOS 26 SDK for compiling the optional transcription path), an Apple development team with a usable certificate/profile, and a paired device with Developer Mode enabled. iOS 26 transcription additionally requires a supported device/language and installed speech model. Capture works on iOS 18 without speech.
 
-1. Open `Recorder.xcodeproj`.
+1. From the repository root, open `Recorder.xcodeproj`.
 2. Select `PeteRecorder` target → Signing & Capabilities → your existing development team. Automatic signing is enabled, but the repository deliberately has no hard-coded team, credentials or provisioning profile. Confirm the bundle ID `studio.otherstuff.PeteRecorder` is available to that team, and preserve this ID for updates to the existing installation. Do not change it when updating.
 3. Select the paired iPhone as the run destination. Enable Developer Mode on the phone and complete any existing trust prompts. Do not create credentials as part of this repository workflow.
 4. With the owner's authorization, use Xcode Product → Run to build, install and launch. Allow microphone access when starting the first recording.
