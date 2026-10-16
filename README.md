@@ -2,7 +2,7 @@
 
 Native clients: [iPhone installation](docs/INSTALLATION.md) · [Android app and build guide](android/README.md). Android APK releases are available through [Zapstore](https://zapstore.dev/apps/com.wingmanbefree.indialogue) and the [release catalog](https://github.com/OtherStuffAI/in-dialogue/releases). Both native codebases share this repository; Android lives under `android/`.
 
-Native SwiftUI iPhone recorder, version 1.3 (build 9), for iOS 18+. Open `Recorder.xcodeproj` in Xcode 26.3 and select `PeteRecorder`.
+Native SwiftUI iPhone recorder, version 1.3 (build 10), for iOS 18+. Open `Recorder.xcodeproj` in Xcode 26.3 and select `PeteRecorder`.
 
 The capture screen has a persistent Normal / Channel / Agent choice, a large route summary, microphone preference and Start recording. Normal preserves ordinary saved delivery. Channel starts a conversation in another accessible workspace channel without forcing an agent mention. Agent uses one canonical directory identity for both its visible and structured mention plus a saved instruction. The complete route is copied into the recording before capture begins. After a reply arrives, its text stays visible, attached audio is preferred for playback, and on-device speech reads text-only replies; Respond records back into the same thread. During capture the screen shows the actual input, elapsed time, a live recording level history and Stop and save. Important audio failures also show an alert.
 

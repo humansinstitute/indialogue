@@ -306,8 +306,12 @@ final class NStackTransfers: ObservableObject {
                 }
                 let result = try await api.request(origin:job.destination.origin,path:path,app:job.destination.appNpub)
                 guard let messages = result["messages"] as? [[String:Any]] else { throw NStackError.malformed }
-                for reply in messages.compactMap({ Self.reply($0) }) where !own.contains(reply.id) {
-                    if newest == nil || (reply.createdAt ?? .distantFuture) >= (newest?.createdAt ?? .distantPast) { newest = reply }
+                for message in messages {
+                    if let id = message["id"] as? String, own.contains(id) { continue }
+                    if let reply = try Self.reply(message) {
+                        // The typed endpoint guarantees created_at ASC, id ASC across pages.
+                        newest = reply
+                    }
                 }
                 cursor = result["next_cursor"] as? String
             } while cursor != nil
@@ -315,17 +319,26 @@ final class NStackTransfers: ObservableObject {
             else { replyNotice = "No new reply yet. Pull to refresh or tap Refresh reply while the app is in the foreground." }
         } catch { replyNotice = error.localizedDescription }
     }
-    static func reply(_ message: [String:Any]) -> DialogueReply? {
-        guard let id = message["id"] as? String, let body = message["body"] as? String, message["deleted_at"] == nil else { return nil }
+    static func reply(_ message: [String:Any]) throws -> DialogueReply? {
+        if message["record_state"] as? String == "deleted" { return nil }
+        if let deletedAt = message["deleted_at"], !(deletedAt is NSNull) { return nil }
         let metadata = message["metadata"] as? [String:Any]
+        if let recorder = metadata?["recorder"], !(recorder is NSNull) { return nil }
+        guard let id = message["id"] as? String, !id.isEmpty,
+              let body = message["body"] as? String else { throw NStackError.malformed }
         let attachments = message["attachments"] as? [[String:Any]] ?? metadata?["attachments"] as? [[String:Any]] ?? []
         let audio = attachments.first { entry in
             let mime = entry["mime_type"] as? String ?? entry["content_type"] as? String ?? ""
             return mime.lowercased().hasPrefix("audio/")
         }?["storage_object_id"] as? String
-        let date = (message["created_at"] as? String).flatMap { ISO8601DateFormatter().date(from:$0) }
+        let date = (message["created_at"] as? String).flatMap(Self.replyDate)
         let sender = message["created_by_actor_label"] as? String ?? message["sender_label"] as? String ?? "Reply"
         return DialogueReply(id:id,body:body,sender:sender,createdAt:date,audioObjectID:audio)
+    }
+    private static func replyDate(_ value: String) -> Date? {
+        let fractional = ISO8601DateFormatter()
+        fractional.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return fractional.date(from:value) ?? ISO8601DateFormatter().date(from:value)
     }
     func toggleReplyPlayback(_ reply: DialogueReply, for jobID: UUID) {
         if playingReplyID == reply.id { stopReply(); return }

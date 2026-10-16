@@ -39,6 +39,8 @@ NStack tests use URLProtocol mocks and injected public synthetic signers. Covera
 
 Build 9 adds focused coverage for persistent Normal / Channel / Agent selection, immutable capture-route round trips, channel payloads without agent mentions, canonical agent visible/structured mentions, initial thread creation, exact signed `thread_id` follow-ups, stable same-conversation IDs, newest reply/audio attachment parsing, and locked foreground-only reply reads. The minimal home UI smoke requires the mode selector and route control without tapping Record. Live agent response timing, private audio download, synthesized speech quality and repeated Respond turns remain phone/workspace checks.
 
+Build 10 adds the live Tower message envelope to reply regressions: `deleted_at: null`, active/deleted record state, recorder metadata, fractional timestamps, inherited/read-only provenance, encoded multi-page cursors, authorized audio selection, empty pages and malformed active rows. A contract failure must show an error; only a valid empty effective thread may show “No new reply yet.”
+
 The pinned package uses a build plugin to copy shared Swift sources. Review the pinned plugin before using `-skipPackagePluginValidation` in unattended builds; interactive Xcode can approve it normally. Keep Package.resolved tracked. Use separate derived-data directories for concurrent destinations to avoid mixed-architecture package artifacts. Live permissions, presigned S3 behavior, receiving-agent execution, phone signing and signed in-place installation require managerial validation.
 
 

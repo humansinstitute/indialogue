@@ -208,7 +208,7 @@ extension NStackTests {
         XCTAssertEqual(queue.jobs[1].conversationID,conversation)
     }
 
-    func testReplyRetrievalNewestAudioAndLockedFailure() async throws {
+    func testReplyRetrievalAcceptsLiveNullDeletionAndNewestInheritedAudio() async throws {
         let root = temp(); defer { try? FileManager.default.removeItem(at:root) }
         let queue = NStackTransfers(root:root), audio = root.appendingPathComponent("audio")
         try Data([1]).write(to:audio)
@@ -222,22 +222,49 @@ extension NStackTests {
             if calls == 1 {
                 XCTAssertNil(URLComponents(url:request.url!,resolvingAgainstBaseURL:false)?.queryItems?.first(where:{$0.name == "cursor"}))
                 return (200,["messages":[
-                    ["id":"mine","body":"My request","created_at":"2026-10-16T01:00:00Z"],
-                    ["id":"older","body":"First answer","created_at":"2026-10-16T01:01:00Z"]
+                    ["id":"mine","body":"My request","record_state":"active","deleted_at":NSNull(),"created_at":"2026-10-16T01:00:00.123Z","metadata":["recorder":["version":1]]],
+                    ["id":"older","body":"First answer","record_state":"active","deleted_at":NSNull(),"created_at":"2026-10-16T01:01:00.234Z","inherited":true,"read_only":true],
+                    ["id":"other-recorder","body":"Recorder follow-up","record_state":"active","deleted_at":NSNull(),"created_at":"2026-10-16T01:01:30.000Z","metadata":["recorder":["version":1]]]
                 ],"next_cursor":"page + two"])
             }
             XCTAssertEqual(URLComponents(url:request.url!,resolvingAgainstBaseURL:false)?.queryItems?.first(where:{$0.name == "cursor"})?.value,"page + two")
             return (200,["messages":[
-                ["id":"reply","body":"Here is the answer","created_by_actor_label":"Rick","created_at":"2026-10-16T01:02:00Z","attachments":[["mime_type":"audio/mp4","storage_object_id":"audio-object"]]]
-            ]])
+                ["id":"deleted","body":"","record_state":"deleted","deleted_at":"2026-10-16T01:01:30.000Z"],
+                ["id":"reply","body":"Here is the answer","record_state":"active","deleted_at":NSNull(),"created_by_actor_label":"Rick","created_at":"2026-10-16T01:02:00.345Z","attachments":[["mime_type":"audio/mp4","storage_object_id":"audio-object"]],"owning_thread_id":"parent","effective_thread_id":"child","inherited":true,"read_only":true]
+            ],"next_cursor":NSNull()])
         }
         restored.setAvailability(active:true,signer:npub,api:api())
         await restored.refreshReply(for:restored.jobs[0].id)
         let reply = try XCTUnwrap(restored.replies[restored.jobs[0].conversationID!])
         XCTAssertEqual(reply.body,"Here is the answer"); XCTAssertEqual(reply.audioObjectID,"audio-object"); XCTAssertEqual(reply.sender,"Rick")
+        XCTAssertNotNil(reply.createdAt)
         restored.setAvailability(active:false,signer:nil,api:api())
         await restored.refreshReply(for:restored.jobs[0].id)
         XCTAssertEqual(calls,2); XCTAssertTrue(restored.replyNotice?.contains("foreground") == true)
+    }
+
+    func testReplyRetrievalEmptyThreadAndMalformedActiveReplyAreDistinct() async throws {
+        let root = temp(); defer { try? FileManager.default.removeItem(at:root) }
+        let queue = NStackTransfers(root:root), audio = root.appendingPathComponent("audio")
+        try Data([1]).write(to:audio)
+        try queue.enqueue(record(),route:DialogueRouteSnapshot(mode:.agent,destination:destination(),threadID:nil),audio:audio,corrected:"First")
+        var ledger = NStackTransfers.Ledger(jobs:queue.jobs,intents:[],destination:nil)
+        ledger.jobs[0].state = "sent"; ledger.jobs[0].messageID = "mine"; ledger.jobs[0].threadID = UUID().uuidString
+        try JSONEncoder().encode(ledger).write(to:root.appendingPathComponent("ledger.json"))
+        let restored = NStackTransfers(root:root); var malformed = false
+        MockNStackProtocol.handler = { _ in
+            if malformed {
+                return (200,["messages":[["id":"reply","record_state":"active","deleted_at":NSNull()]],"next_cursor":NSNull()])
+            }
+            return (200,["messages":[],"next_cursor":NSNull()])
+        }
+        restored.setAvailability(active:true,signer:npub,api:api())
+        await restored.refreshReply(for:restored.jobs[0].id)
+        XCTAssertTrue(restored.replyNotice?.contains("No new reply yet") == true)
+
+        malformed = true
+        await restored.refreshReply(for:restored.jobs[0].id)
+        XCTAssertEqual(restored.replyNotice,NStackError.malformed.localizedDescription)
     }
 }
 
