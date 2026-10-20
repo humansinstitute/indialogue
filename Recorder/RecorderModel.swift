@@ -272,24 +272,42 @@ final class RecorderModel: NSObject, ObservableObject, AVAudioRecorderDelegate, 
         active = r
         try persist(r)
     }
-    func stop(interrupted: Bool = false) {
+    func stop(interrupted: Bool = false, publishAudioOnly: Bool = false) {
         timer?.invalidate(); timer = nil
         levels.stop(); routeHistory.stop()
         guard active != nil else { return }
         var finalSegmentFailed = false
         do { try closeSegment() } catch { finalSegmentFailed = true; report(error) }
+        var delivery: (recording: Recording, force: Bool)?
         if var r = active {
             r.state = interrupted || finalSegmentFailed ? .interrupted : .saved
-            if !interrupted && !finalSegmentFailed { transfers.rememberNew(r); r.transcriptionState = .queued; r.transcriptionNotice = "Queued for transcription using installed speech model." }
+            if !interrupted && !finalSegmentFailed {
+                if publishAudioOnly {
+                    r.deliveryContent = .audioOnly
+                    r.transcriptionState = .none
+                    r.transcriptionNotice = "Local transcription skipped. Audio will be transcribed by the agent/server."
+                    r.events.append("Saved for audio-first delivery without local transcription.")
+                    delivery = (r, true)
+                } else {
+                    r.deliveryContent = .transcriptAndAudio
+                    r.transcriptionState = .queued
+                    r.transcriptionNotice = "Queued for transcription using installed speech model."
+                    delivery = (r, false)
+                }
+            }
             if interrupted || finalSegmentFailed { r.events.append("Capture stopped unexpectedly; inspect saved audio before resuming a new recording.") }
-            do { try persist(r) } catch { report(error) }
+            do { try persist(r) }
+            catch { delivery = nil; report(error) }
             recordings.removeAll { $0.id == r.id }; recordings.insert(r, at: 0)
         }
         active = nil; elapsed = 0
+        if let delivery, !transfers.rememberNew(delivery.recording, force:delivery.force), delivery.force {
+            message = "Audio saved, but it cannot publish until an NStack destination is configured."
+        }
         runRetention()
         try? session.setActive(false, options: .notifyOthersOnDeactivation)
         refreshRoute()
-        resumeTranscriptionQueue()
+        resumeTranscriptionQueue(); resumeUploadSnapshots()
     }
     private func notification(_ note: Notification) {
         if note.name == AVAudioSession.routeChangeNotification {
@@ -481,7 +499,7 @@ final class RecorderModel: NSObject, ObservableObject, AVAudioRecorderDelegate, 
     }
     func resumeUploadSnapshots() {
         guard !capturePending, snapshotTask == nil, transcriptionTask == nil, active == nil, !suspended, !transcribing else { return }
-        guard let intent = transfers.intents.first(where: { intent in intent.notice == nil && recordings.contains { $0.id == intent.recordingID && $0.transcriptionState == .complete } }), let r = recordings.first(where: { $0.id == intent.recordingID }) else { return }
+        guard let intent = transfers.intents.first(where: { intent in intent.notice == nil && recordings.contains { $0.id == intent.recordingID && $0.deliveryReady } }), let r = recordings.first(where: { $0.id == intent.recordingID }) else { return }
         upload(r, destination:intent.destination, route:intent.route)
     }
     var preparingUpload: Bool { snapshotTask != nil }
@@ -497,8 +515,8 @@ final class RecorderModel: NSObject, ObservableObject, AVAudioRecorderDelegate, 
             busy = true
             defer { busy = false; snapshotTask = nil; runRetention(); resumeTranscriptionQueue(); resumeUploadSnapshots() }
             do {
-                guard r.transcriptionState == .complete else { throw NStackError.incomplete }
-                let corrected = TranscriptCorrections.apply(r.reviewText, vocabulary:vocabulary)
+                guard r.deliveryReady else { throw NStackError.incomplete }
+                let corrected = r.deliveryContent == .audioOnly ? "" : TranscriptCorrections.apply(r.reviewText, vocabulary:vocabulary)
                 let audio: URL
                 if let audioExport { audio = try await audioExport(r) } else { audio = try await export(r, requireComplete:true) }
                 defer { try? FileManager.default.removeItem(at:audio) }
@@ -506,6 +524,22 @@ final class RecorderModel: NSObject, ObservableObject, AVAudioRecorderDelegate, 
                 try transfers.enqueue(r,route:immutableRoute ?? DialogueRouteSnapshot(mode:.normal,destination:d,threadID:nil),audio:audio,corrected:corrected)
             } catch { if !(error is CancellationError) { transfers.snapshotFailed(r.id,error:error); report(error) } }
         }
+    }
+    func uploadAudioOnly(_ original: Recording) {
+        guard var r = recordings.first(where: { $0.id == original.id }), r.state == .saved else { return }
+        if transcriptionID == r.id { cancelTranscription() }
+        r.deliveryContent = .audioOnly
+        r.transcriptionState = .none
+        r.transcriptionNotice = "Local transcription skipped. Audio will be transcribed by the agent/server."
+        r.events.append("Prepared for audio-first delivery without local transcription.")
+        do {
+            try persist(r); replace(r)
+            if !transfers.jobs.contains(where: { $0.recordingID == r.id && $0.state != "cancelled" }),
+               !transfers.rememberNew(r, force: true) {
+                message = "Audio saved, but it cannot publish until an NStack destination is configured."
+            }
+            upload(r)
+        } catch { report(error) }
     }
     func saveVocabulary(_ rules: [VocabularyCorrection]) {
         guard vocabularyReadable else { message = "Vocabulary file unreadable. File retained; cannot overwrite it."; return }

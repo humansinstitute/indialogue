@@ -217,11 +217,17 @@ final class NStackTransfers: ObservableObject {
     var latestConversationJob: TransferJob? {
         jobs.reversed().first { $0.state == "sent" && $0.threadID != nil && $0.conversationID != nil }
     }
-    func rememberNew(_ r: Recording) {
+    @discardableResult func rememberNew(_ r: Recording, force: Bool = false) -> Bool {
         let route = r.dialogueRoute
-        guard let d = route?.destination ?? destination, d.automatic else { return }
+        guard let d = route?.destination ?? destination, force || d.automatic else { return false }
+        guard !intents.contains(where: { $0.recordingID == r.id }) else { return true }
         intents.append(AutomaticUploadIntent(recordingID:r.id,destination:d,route:route))
-        do { try persist() } catch { notice = error.localizedDescription }
+        do { try persist(); return true }
+        catch {
+            intents.removeAll { $0.recordingID == r.id }
+            notice = error.localizedDescription
+            return false
+        }
     }
     func snapshotFailed(_ id: UUID, error: Error) {
         if let i = intents.firstIndex(where: { $0.recordingID == id }) { intents[i].notice = error.localizedDescription }
@@ -230,7 +236,7 @@ final class NStackTransfers: ObservableObject {
     }
     func status(_ id: UUID) -> String? {
         if let j = jobs.last(where: { $0.recordingID == id }) { return j.state.replacingOccurrences(of: "_", with: " ") + (j.notice.map { " · " + $0 } ?? "") }
-        if let intent = intents.first(where: { $0.recordingID == id }) { return intent.notice ?? "Waiting for transcription" }; return nil
+        if let intent = intents.first(where: { $0.recordingID == id }) { return intent.notice ?? "Waiting for transcription or upload preparation" }; return nil
     }
     static func checksum(_ url: URL) throws -> (Int,String) {
         let handle = try FileHandle(forReadingFrom: url); defer { try? handle.close() }
@@ -244,17 +250,26 @@ final class NStackTransfers: ObservableObject {
     func enqueue(_ r: Recording, route: DialogueRouteSnapshot, audio: URL, corrected: String) throws {
         let d = route.destination
         try d.validate()
-        guard r.state == .saved, r.transcriptionState == .complete, !r.segments.isEmpty else { throw NStackError.incomplete }
+        guard r.state == .saved, r.deliveryReady, !r.segments.isEmpty else { throw NStackError.incomplete }
         guard !jobs.contains(where: { $0.recordingID == r.id && $0.state != "cancelled" }) else { return }
         let id = UUID(); let directory = root.appendingPathComponent(id.uuidString)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         let audioTarget = directory.appendingPathComponent("recording.m4a")
         try FileManager.default.copyItem(at: audio, to: audioTarget)
         let (size, hash) = try Self.checksum(audioTarget)
-        let artifact: [String:Any] = ["version":1,"recording_id":r.id.uuidString,"snapshot_id":id.uuidString,"title":r.title,"created_at":ISO8601DateFormatter().string(from:r.createdAt),"duration_seconds":r.duration,"events":r.events,"raw_transcript":r.transcript ?? "","corrected_transcript":corrected,"prompt":d.prompt,"audio_sha256":hash,"audio_size_bytes":size,"destination_workspace":d.workspace,"destination_channel":d.channel,"signer_npub":d.signer]
+        var artifact: [String:Any] = ["version":1,"recording_id":r.id.uuidString,"snapshot_id":id.uuidString,"title":r.title,"created_at":ISO8601DateFormatter().string(from:r.createdAt),"duration_seconds":r.duration,"events":r.events,"transcription_status":r.deliveryContent == .audioOnly ? "not_requested" : "complete","transcript_attached":r.deliveryContent == .transcriptAndAudio,"prompt":d.prompt,"audio_sha256":hash,"audio_size_bytes":size,"destination_workspace":d.workspace,"destination_channel":d.channel,"signer_npub":d.signer]
+        if r.deliveryContent == .transcriptAndAudio {
+            artifact["raw_transcript"] = r.transcript ?? ""
+            artifact["corrected_transcript"] = corrected
+        } else {
+            artifact["transcription_requested"] = "agent_or_server"
+        }
         let transcript = try NostrCodec.json(artifact); try transcript.write(to: directory.appendingPathComponent("transcript.json"), options: .atomic)
         let mention = d.recipient.map { "@[\(d.recipientLabel!)](mention:agent:\($0))\n\n" } ?? ""
-        let body = (mention + d.prompt + "\n\n" + r.title + "\n\n" + String(corrected.prefix(4000)) + "\n\nFull corrected transcript and audio attached.").trimmingCharacters(in: .whitespacesAndNewlines)
+        let content = r.deliveryContent == .audioOnly
+            ? "The attached audio is the source recording. Please transcribe and process it on the agent/server. No transcript is attached."
+            : String(corrected.prefix(4000)) + "\n\nFull corrected transcript and audio attached."
+        let body = (mention + d.prompt + "\n\n" + r.title + "\n\n" + content).trimmingCharacters(in: .whitespacesAndNewlines)
         jobs.append(TransferJob(id:id,recordingID:r.id,destination:d,title:r.title.isEmpty ? "Recording" : r.title,body:body,files:[TransferFile(name:"recording.m4a",mime:"audio/mp4",size:size,checksum:hash),TransferFile(name:"transcript.json",mime:"application/json",size:transcript.count,checksum:NostrCodec.hash(transcript))],threadID:route.threadID,conversationID:route.conversationID,dialogueMode:route.mode,respondingToReplyID:route.respondingToReplyID))
         let last = jobs.count - 1
         if currentSigner == nil { jobs[last].state = "paused_locked"; jobs[last].notice = "Unlock identity while the app is active to send." }

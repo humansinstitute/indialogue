@@ -102,13 +102,19 @@ struct RecorderView: View {
                     Text(Duration.seconds(model.elapsed).formatted(.time(pattern: .hourMinuteSecond)))
                         .font(.largeTitle.monospacedDigit()).accessibilityLabel("Recording duration")
                 }
-                Button {
-                    if model.active != nil { model.stop() } else { Task { await model.start() } }
-                } label: {
-                    Label(model.active == nil ? "Start recording" : "Stop and save", systemImage: model.active == nil ? "record.circle" : "stop.circle.fill")
-                        .font(.title3.bold()).frame(maxWidth: .infinity).padding(.vertical, 12)
-                }.buttonStyle(.borderedProminent).tint(.red)
-                    .disabled((model.busy && !model.preparingUpload) || model.store == nil).accessibilityIdentifier("recordButton")
+                if model.active == nil {
+                    Button { Task { await model.start() } } label: {
+                        Label("Start recording", systemImage:"record.circle").font(.title3.bold()).frame(maxWidth:.infinity).padding(.vertical,12)
+                    }.buttonStyle(.borderedProminent).tint(.red)
+                        .disabled((model.busy && !model.preparingUpload) || model.store == nil).accessibilityIdentifier("recordButton")
+                } else {
+                    Button { model.stop(publishAudioOnly:true) } label: {
+                        Label("Stop, upload & publish audio",systemImage:"arrow.up.circle.fill").font(.title3.bold()).frame(maxWidth:.infinity).padding(.vertical,12)
+                    }.buttonStyle(.borderedProminent).tint(.red).disabled(model.store == nil).accessibilityIdentifier("publishAudioButton")
+                    Button { model.stop() } label: {
+                        Label("Stop and transcribe locally",systemImage:"stop.circle.fill").frame(maxWidth:.infinity).padding(.vertical,8)
+                    }.buttonStyle(.bordered).disabled(model.store == nil).accessibilityIdentifier("recordButton")
+                }
                 if model.active == nil, let job = transfers.latestConversationJob {
                     conversation(job)
                 }
@@ -320,8 +326,13 @@ struct RecorderView: View {
                 }
                 Section("NStack delivery") {
                     if let status = transfers.status(r.id) { Text(status) }
-                    Button(transfers.jobs.last(where: { $0.recordingID == r.id && $0.state != "cancelled" })?.state == "failed" ? "Retry upload · same snapshot" : "Upload corrected transcript and audio") { model.upload(r) }.disabled(model.busy || model.active != nil || r.transcriptionState != .complete)
-                    Text("Uses current reviewed text with saved vocabulary. Unaccepted cleanup drafts are excluded.").font(.footnote)
+                    if transfers.jobs.last(where: { $0.recordingID == r.id && $0.state != "cancelled" })?.state == "failed" {
+                        Button("Retry upload · same snapshot") { model.upload(r) }.disabled(model.busy || model.active != nil)
+                    } else if !transfers.jobs.contains(where: { $0.recordingID == r.id && $0.state != "cancelled" }) {
+                        Button("Upload corrected transcript and audio") { model.upload(r) }.disabled(model.busy || model.active != nil || r.transcriptionState != .complete)
+                        Button("Upload audio for agent/server transcription") { model.uploadAudioOnly(r) }.disabled(model.busy || model.active != nil)
+                    }
+                    Text("Choose corrected text plus audio, or send only the saved audio and ask the receiving agent/server to transcribe it. Unaccepted cleanup drafts are excluded.").font(.footnote)
                 }
                 Section("Local transcription") {
                     Text(model.speechStatus).font(.footnote)

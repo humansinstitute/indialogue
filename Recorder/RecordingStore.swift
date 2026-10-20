@@ -2,7 +2,7 @@ import Foundation
 import AVFoundation
 
 struct Recording: Codable, Identifiable, Equatable {
-    var schemaVersion = 2
+    var schemaVersion = 3
     var id = UUID()
     var title: String
     var createdAt = Date()
@@ -16,17 +16,20 @@ struct Recording: Codable, Identifiable, Equatable {
     var cleanupDraft: String?
     var transcriptionState: TranscriptionState = .none
     var transcriptionNotice: String?
+    var deliveryContent: DeliveryContent = .transcriptAndAudio
     var dialogueRoute: DialogueRouteSnapshot?
     enum TranscriptionState: String, Codable { case none, queued, running, complete, failed, cancelled }
+    enum DeliveryContent: String, Codable { case transcriptAndAudio, audioOnly }
+    var deliveryReady: Bool { deliveryContent == .audioOnly || transcriptionState == .complete }
     var reviewText: String { correctedTranscript ?? transcript ?? "" }
     enum CodingKeys: String, CodingKey {
         case schemaVersion, id, title, createdAt, state, segments, duration, events, transcript, transcriptionLocale
-        case correctedTranscript, cleanupDraft, transcriptionState, transcriptionNotice, dialogueRoute
+        case correctedTranscript, cleanupDraft, transcriptionState, transcriptionNotice, deliveryContent, dialogueRoute
     }
     init(title: String) { self.title = title }
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
-        schemaVersion = max(2, try c.decodeIfPresent(Int.self, forKey: .schemaVersion) ?? 1)
+        schemaVersion = max(3, try c.decodeIfPresent(Int.self, forKey: .schemaVersion) ?? 1)
         id = try c.decode(UUID.self, forKey: .id)
         title = try c.decode(String.self, forKey: .title)
         createdAt = try c.decodeIfPresent(Date.self, forKey: .createdAt) ?? Date()
@@ -40,6 +43,7 @@ struct Recording: Codable, Identifiable, Equatable {
         cleanupDraft = try c.decodeIfPresent(String.self, forKey: .cleanupDraft)
         transcriptionState = try c.decodeIfPresent(TranscriptionState.self, forKey: .transcriptionState) ?? (transcript == nil ? .none : .complete)
         transcriptionNotice = try c.decodeIfPresent(String.self, forKey: .transcriptionNotice)
+        deliveryContent = try c.decodeIfPresent(DeliveryContent.self, forKey: .deliveryContent) ?? .transcriptAndAudio
         dialogueRoute = try c.decodeIfPresent(DialogueRouteSnapshot.self, forKey: .dialogueRoute)
     }
     enum State: String, Codable { case recording, saved, interrupted }

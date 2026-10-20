@@ -48,7 +48,7 @@ final class NStackTests: XCTestCase {
         let root = temp(); defer { try? FileManager.default.removeItem(at:root) }
         let queue = NStackTransfers(root:root); let d = destination(); try queue.save(d)
         let r = record(); XCTAssertNil(queue.status(r.id))
-        queue.rememberNew(r); XCTAssertEqual(queue.status(r.id),"Waiting for transcription")
+        queue.rememberNew(r); XCTAssertEqual(queue.status(r.id),"Waiting for transcription or upload preparation")
         let audio = root.appendingPathComponent("source.m4a"); try Data([1,2,3]).write(to:audio)
         try queue.enqueue(r,destination:d,audio:audio,corrected:"Edited nostr")
         var job = try XCTUnwrap(queue.jobs.first)
@@ -109,6 +109,119 @@ final class NStackTests: XCTestCase {
 }
 
 extension NStackTests {
+    func testAudioFirstStopSkipsSpeechAndCreatesHonestUploadSnapshot() async throws {
+        let root = temp(); defer { try? FileManager.default.removeItem(at:root) }
+        var speechCalls = 0
+        let model = RecorderModel(root:root,speech:{ _,_ in
+            speechCalls += 1
+            return LocalTranscript(text:"must not run",locale:"en")
+        },audioExport:{ _ in
+            let file = root.appendingPathComponent(UUID().uuidString + ".m4a")
+            try Data([1,2,3]).write(to:file); return file
+        })
+        var d = destination(); d.automatic = false
+        try model.transfers.save(d)
+        var recording = Recording(title:"Audio first")
+        recording.segments = ["segment.m4a"]
+        recording.dialogueRoute = DialogueRouteSnapshot(mode:.agent,destination:d,threadID:nil)
+        try model.store!.save(recording); model.active = recording
+
+        model.stop(publishAudioOnly:true)
+        for _ in 0..<300 where model.transfers.jobs.isEmpty || model.preparingUpload { try await Task.sleep(for:.milliseconds(10)) }
+
+        XCTAssertEqual(speechCalls,0)
+        let saved = try XCTUnwrap(model.recordings.first(where:{$0.id == recording.id}))
+        XCTAssertEqual(saved.deliveryContent,.audioOnly)
+        XCTAssertEqual(saved.transcriptionState,.none)
+        let job = try XCTUnwrap(model.transfers.jobs.first)
+        XCTAssertTrue(job.body.contains("Please transcribe and process it on the agent/server"))
+        XCTAssertTrue(job.body.contains("No transcript is attached"))
+        XCTAssertTrue(job.body.hasPrefix("@[Agent](mention:agent:\(d.recipient!))"))
+        XCTAssertFalse(job.body.contains("Full corrected transcript"))
+        let artifactURL = model.transfers.root.appendingPathComponent(job.id.uuidString).appendingPathComponent("transcript.json")
+        let artifact = try JSONSerialization.jsonObject(with:Data(contentsOf:artifactURL)) as! [String:Any]
+        XCTAssertEqual(artifact["transcription_status"] as? String,"not_requested")
+        XCTAssertEqual(artifact["transcription_requested"] as? String,"agent_or_server")
+        XCTAssertEqual(artifact["transcript_attached"] as? Bool,false)
+        XCTAssertNil(artifact["raw_transcript"])
+        XCTAssertNil(artifact["corrected_transcript"])
+        var postedJob = job
+        for index in postedJob.files.indices { postedJob.files[index].objectID = UUID().uuidString }
+        let payload = try api().message(postedJob)
+        let mention = try XCTUnwrap((payload["mentions"] as? [[String:String]])?.first)
+        XCTAssertEqual(mention["npub"],d.recipient)
+        XCTAssertEqual(mention["label"],d.recipientLabel)
+        XCTAssertEqual(postedJob.destination.channel,d.channel)
+
+        model.startTranscription(saved,download:false)
+        for _ in 0..<300 where model.recordings.first(where:{$0.id == recording.id})?.transcriptionState != .complete { try await Task.sleep(for:.milliseconds(10)) }
+        XCTAssertEqual(speechCalls,1,"A retained audio-first recording can still be transcribed later by explicit request")
+        model.background()
+    }
+
+    func testAudioOnlySnapshotPersistsAcrossRelaunchWithoutTranscript() throws {
+        let root = temp(); defer { try? FileManager.default.removeItem(at:root) }
+        let queue = NStackTransfers(root:root), d = destination()
+        var recording = Recording(title:"Persist audio first")
+        recording.state = .saved; recording.segments = ["segment.m4a"]
+        recording.deliveryContent = .audioOnly
+        let audio = root.appendingPathComponent("source.m4a"); try Data([7,8,9]).write(to:audio)
+        try queue.enqueue(recording,destination:d,audio:audio,corrected:"")
+
+        let restored = NStackTransfers(root:root)
+        let job = try XCTUnwrap(restored.jobs.first)
+        XCTAssertEqual(job.recordingID,recording.id)
+        XCTAssertTrue(job.body.contains("No transcript is attached"))
+        XCTAssertEqual(job.files.map(\.name),["recording.m4a","transcript.json"])
+    }
+
+    func testAudioFirstRelaunchResumesIntentAndManualRetryReusesSnapshot() async throws {
+        let root = temp()
+        let transferRoot = root.deletingLastPathComponent().appendingPathComponent(root.lastPathComponent + "-transfers")
+        defer { try? FileManager.default.removeItem(at:root); try? FileManager.default.removeItem(at:transferRoot) }
+        let store = try RecordingStore(root:root)
+        var recording = Recording(title:"Relaunch audio first")
+        recording.state = .saved; recording.segments = ["segment.m4a"]; recording.deliveryContent = .audioOnly
+        recording.dialogueRoute = DialogueRouteSnapshot(mode:.agent,destination:destination(),threadID:nil)
+        try store.save(recording)
+        let queue = NStackTransfers(root:transferRoot)
+        XCTAssertTrue(queue.rememberNew(recording,force:true))
+
+        var speechCalls = 0, exports = 0
+        let launched = RecorderModel(root:root,speech:{ _,_ in
+            speechCalls += 1; return LocalTranscript(text:"unexpected",locale:"en")
+        },audioExport:{ _ in
+            exports += 1
+            let file = root.appendingPathComponent("relaunch-export.m4a")
+            try Data([4,5,6]).write(to:file); return file
+        })
+        for _ in 0..<300 where launched.transfers.jobs.isEmpty || launched.preparingUpload { try await Task.sleep(for:.milliseconds(10)) }
+        XCTAssertEqual(speechCalls,0)
+        XCTAssertEqual(exports,1)
+        XCTAssertEqual(launched.recordings.first?.deliveryContent,.audioOnly)
+        let immutable = try XCTUnwrap(launched.transfers.jobs.first)
+
+        var ledger = NStackTransfers.Ledger(jobs:launched.transfers.jobs,intents:launched.transfers.intents,destination:nil)
+        ledger.jobs[0].state = "failed"
+        try JSONEncoder().encode(ledger).write(to:transferRoot.appendingPathComponent("ledger.json"),options:.atomic)
+        launched.background()
+
+        let retried = RecorderModel(root:root,speech:{ _,_ in
+            XCTFail("Retry must not start local transcription")
+            return LocalTranscript(text:"unexpected",locale:"en")
+        },audioExport:{ _ in
+            XCTFail("Retry must reuse the immutable snapshot")
+            throw NStackError.incomplete
+        })
+        retried.uploadAudioOnly(recording)
+        XCTAssertEqual(retried.transfers.jobs.count,1)
+        XCTAssertEqual(retried.transfers.jobs[0].id,immutable.id)
+        XCTAssertEqual(retried.transfers.jobs[0].files,immutable.files)
+        XCTAssertEqual(retried.transfers.jobs[0].body,immutable.body)
+        XCTAssertEqual(retried.transfers.jobs[0].state,"paused_locked")
+        retried.background()
+    }
+
     func testAutomaticTranscriptionThenCurrentVocabularySnapshotAndOldLibraryExclusion() async throws {
         let root = temp(); defer { try? FileManager.default.removeItem(at:root) }
         let model = RecorderModel(root:root,speech:{ _,_ in LocalTranscript(text:"nosta 42",locale:"en") },audioExport:{ _ in

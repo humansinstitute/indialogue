@@ -10,13 +10,14 @@ final class V11PersistenceTests: XCTestCase {
         r.segments = ["original.m4a"]; try store.save(r)
         let manifest = store.directory(r.id).appendingPathComponent("metadata.json")
         var json = try JSONSerialization.jsonObject(with: Data(contentsOf: manifest)) as! [String: Any]
-        for key in ["correctedTranscript", "cleanupDraft", "transcriptionState", "transcriptionNotice"] { json.removeValue(forKey: key) }
+        for key in ["correctedTranscript", "cleanupDraft", "transcriptionState", "transcriptionNotice", "deliveryContent"] { json.removeValue(forKey: key) }
         json["schemaVersion"] = 1
         try JSONSerialization.data(withJSONObject: json).write(to: manifest)
         let bytes = Data([1,2,3,4]); try bytes.write(to: store.audio(r, "original.m4a"))
         var restored = try XCTUnwrap(store.recover().first)
         XCTAssertEqual(restored.id, r.id); XCTAssertEqual(restored.transcript, r.transcript)
         XCTAssertEqual(restored.transcriptionState, .complete); XCTAssertNil(restored.correctedTranscript)
+        XCTAssertEqual(restored.deliveryContent, .transcriptAndAudio)
         restored.correctedTranscript = "Nostr, 123."; restored.cleanupDraft = "Nostr, 123!"
         try store.save(restored)
         XCTAssertEqual(try store.load().first, restored)
