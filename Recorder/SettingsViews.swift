@@ -222,9 +222,21 @@ struct RecordingRetentionSettings: View {
     @ObservedObject var model: RecorderModel
     @State private var enabled = false
     @State private var days = "30"
+    @State private var recentConversationLimit = "5"
+    @State private var conversationLimitNotice: String?
     @FocusState private var editingDays: Bool
     var body: some View {
         Form {
+            Section("Recent conversations") {
+                TextField("Number to show",text:$recentConversationLimit).keyboardType(.numberPad)
+                    .accessibilityIdentifier("recentConversationLimit")
+                Text("Choose 1–50 conversations.").font(.footnote)
+                Button("Save conversation limit") {
+                    if model.transfers.saveRecentConversationLimit(recentConversationLimit) { conversationLimitNotice = "Saved: show \(model.transfers.recentConversationLimit) conversations." }
+                    else { conversationLimitNotice = "Enter a whole number from 1 to 50." }
+                }.accessibilityIdentifier("saveConversationLimit")
+                if let conversationLimitNotice { Text(conversationLimitNotice).accessibilityIdentifier("conversationLimitNotice") }
+            }
             Section("Automatic deletion") {
                 Toggle("Automatically delete recordings", isOn: $enabled).accessibilityIdentifier("retentionEnabled")
                 TextField("Days to keep recordings", text: $days).keyboardType(.numberPad).focused($editingDays)
@@ -241,6 +253,10 @@ struct RecordingRetentionSettings: View {
                 Text("Enabling this applies to existing recordings too. Export anything you want to keep before saving.")
             }
         }.navigationTitle("Settings")
-            .onAppear { enabled = model.retention.enabled; days = String(model.retention.days) }
+            .onAppear {
+                enabled = model.retention.enabled
+                days = String(model.retention.days)
+                recentConversationLimit = String(model.transfers.recentConversationLimit)
+            }
     }
 }

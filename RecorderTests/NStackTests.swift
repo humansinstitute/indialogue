@@ -109,6 +109,58 @@ final class NStackTests: XCTestCase {
 }
 
 extension NStackTests {
+    func testRecentConversationLimitValidationPersistenceAndNewestUniqueSelection() throws {
+        XCTAssertEqual(NStackTransfers.validatedRecentConversationLimit(nil),5)
+        XCTAssertEqual(NStackTransfers.validatedRecentConversationLimit("21"),5)
+        XCTAssertEqual(NStackTransfers.validatedRecentConversationLimit(true),5)
+        XCTAssertEqual(NStackTransfers.validatedRecentConversationLimit(0),5)
+        XCTAssertEqual(NStackTransfers.validatedRecentConversationLimit(51),5)
+        XCTAssertEqual(NStackTransfers.validatedRecentConversationLimit(21),21)
+
+        let root = temp(); defer { try? FileManager.default.removeItem(at:root) }
+        let destination = destination(), sharedConversation = UUID()
+        var oldest = TransferJob(recordingID:UUID(),destination:destination,title:"Old",body:"",createdAt:Date(timeIntervalSince1970:1),files:[],conversationID:sharedConversation)
+        oldest.state = "sent"; oldest.threadID = "thread"
+        var followup = TransferJob(recordingID:UUID(),destination:destination,title:"Follow up",body:"",createdAt:Date(timeIntervalSince1970:2),files:[],conversationID:sharedConversation)
+        followup.state = "sent"; followup.threadID = "thread"
+        let newest = TransferJob(recordingID:UUID(),destination:destination,title:"Newest",body:"",createdAt:Date(timeIntervalSince1970:3),files:[],conversationID:UUID())
+        try FileManager.default.createDirectory(at:root,withIntermediateDirectories:true)
+        try JSONEncoder().encode(NStackTransfers.Ledger(jobs:[oldest,followup,newest],intents:[],destination:nil)).write(to:root.appendingPathComponent("ledger.json"))
+
+        let suite = "RecentConversationTests." + UUID().uuidString
+        let defaults = try XCTUnwrap(UserDefaults(suiteName:suite))
+        defer { defaults.removePersistentDomain(forName:suite) }
+        let transfers = NStackTransfers(root:root,defaults:defaults)
+        XCTAssertTrue(transfers.saveRecentConversationLimit("21"))
+        XCTAssertEqual(transfers.recentConversationLimit,21)
+        XCTAssertEqual(transfers.recentConversationJobs.map(\.title),["Newest","Follow up"])
+        XCTAssertEqual(NStackTransfers(root:root,defaults:defaults).recentConversationLimit,21)
+        XCTAssertFalse(transfers.saveRecentConversationLimit("banana"))
+        XCTAssertFalse(transfers.saveRecentConversationLimit("51"))
+        XCTAssertEqual(transfers.recentConversationLimit,21)
+    }
+
+    func testConversationStatusAndGreyRetryKeepImmutableDestination() throws {
+        let root = temp(); defer { try? FileManager.default.removeItem(at:root) }
+        let immutable = destination()
+        var local = TransferJob(recordingID:UUID(),destination:immutable,title:"Pending",body:"",files:[],state:"failed",notice:"Offline",conversationID:UUID(),dialogueMode:.agent)
+        try FileManager.default.createDirectory(at:root,withIntermediateDirectories:true)
+        try JSONEncoder().encode(NStackTransfers.Ledger(jobs:[local],intents:[],destination:nil)).write(to:root.appendingPathComponent("ledger.json"))
+        let transfers = NStackTransfers(root:root)
+        XCTAssertEqual(transfers.conversationStatus(for:transfers.jobs[0]),.failed)
+        transfers.sendPendingConversation(transfers.jobs[0].id)
+        XCTAssertEqual(transfers.jobs[0].state,"paused_locked")
+        XCTAssertEqual(transfers.jobs[0].destination,immutable)
+
+        local.state = "sent"; local.threadID = "thread"
+        try JSONEncoder().encode(NStackTransfers.Ledger(jobs:[local],intents:[],destination:nil)).write(to:root.appendingPathComponent("ledger.json"))
+        let sent = NStackTransfers(root:root)
+        XCTAssertEqual(sent.conversationStatus(for:sent.jobs[0]),.waiting)
+        let conversation = try XCTUnwrap(sent.jobs[0].conversationID)
+        XCTAssertTrue(sent.storeReply(DialogueReply(id:"reply",body:"Done",sender:"Rick",createdAt:nil,audioObjectID:nil),for:conversation))
+        XCTAssertEqual(sent.conversationStatus(for:sent.jobs[0]),.replied)
+    }
+
     func testAudioFirstStopSkipsSpeechAndCreatesHonestUploadSnapshot() async throws {
         let root = temp(); defer { try? FileManager.default.removeItem(at:root) }
         var speechCalls = 0

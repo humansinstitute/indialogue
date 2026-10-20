@@ -82,6 +82,12 @@ enum DialogueResponseStatus: Equatable {
     case failed(String?)
     case sent
 }
+enum ConversationDeliveryStatus: Equatable {
+    case local
+    case waiting
+    case replied
+    case failed
+}
 /// Independent of views. Atomic ledger contains no secret or Authorization headers.
 @MainActor
 final class NStackTransfers: ObservableObject {
@@ -92,6 +98,7 @@ final class NStackTransfers: ObservableObject {
     @Published private(set) var replyStates: [UUID:DialogueReplyState] = [:]
     @Published var replyNotice: String?
     @Published private(set) var playingReplyID: String?
+    @Published private(set) var recentConversationLimit: Int
     @Published var notice: String?
     private(set) var intents: [AutomaticUploadIntent] = []
     let root: URL
@@ -107,6 +114,10 @@ final class NStackTransfers: ObservableObject {
     private(set) var replyRefreshJobID: UUID?
     private var replyPlayer: AVAudioPlayer?
     private let speech = AVSpeechSynthesizer()
+    private let defaults: UserDefaults
+    static let defaultRecentConversationLimit = 5
+    static let recentConversationLimitRange = 1...50
+    static let recentConversationLimitKey = "recentConversationLimit"
     private lazy var playbackDelegate = ReplyPlaybackDelegate { [weak self] in
         Task { @MainActor in
             self?.replyPlayer = nil
@@ -132,8 +143,12 @@ final class NStackTransfers: ObservableObject {
             replyStates = try c.decodeIfPresent([UUID:DialogueReplyState].self,forKey:.replyStates) ?? [:]
         }
     }
-    init(root: URL) {
+    init(root: URL, defaults providedDefaults: UserDefaults? = nil) {
         self.root = root
+        defaults = providedDefaults ?? .standard
+        recentConversationLimit = Self.validatedRecentConversationLimit(
+            defaults.object(forKey: Self.recentConversationLimitKey)
+        )
         do {
             try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
             var dir = root; var values = URLResourceValues(); values.isExcludedFromBackup = true; try dir.setResourceValues(values)
@@ -144,6 +159,17 @@ final class NStackTransfers: ObservableObject {
                 for i in jobs.indices where ["uploading","posting"].contains(jobs[i].state) { jobs[i].state = "queued" }
             }
         } catch { readable = false; notice = "Transfer ledger unreadable; retained and cannot be overwritten. \(error.localizedDescription)" }
+    }
+    static func validatedRecentConversationLimit(_ value: Any?) -> Int {
+        guard let number = value as? NSNumber,
+              CFGetTypeID(number) != CFBooleanGetTypeID() else { return defaultRecentConversationLimit }
+        return recentConversationLimitRange.contains(number.intValue) ? number.intValue : defaultRecentConversationLimit
+    }
+    @discardableResult func saveRecentConversationLimit(_ text: String) -> Bool {
+        guard let value = Int(text), Self.recentConversationLimitRange.contains(value) else { return false }
+        recentConversationLimit = value
+        defaults.set(value, forKey: Self.recentConversationLimitKey)
+        return true
     }
     var onIdle: (() -> Void)?
     var retentionReady: Bool { readable && worker == nil }
@@ -216,6 +242,25 @@ final class NStackTransfers: ObservableObject {
     }
     var latestConversationJob: TransferJob? {
         jobs.reversed().first { $0.state == "sent" && $0.threadID != nil && $0.conversationID != nil }
+    }
+    var recentConversationJobs: [TransferJob] {
+        var seen = Set<UUID>()
+        return jobs.sorted { $0.createdAt > $1.createdAt }.filter { job in
+            guard job.state != "cancelled", let conversation = job.conversationID,
+                  seen.insert(conversation).inserted else { return false }
+            return true
+        }.prefix(recentConversationLimit).map { $0 }
+    }
+    func conversationStatus(for job: TransferJob) -> ConversationDeliveryStatus {
+        if let conversation = job.conversationID, let reply = replies[conversation] {
+            switch responseStatus(to:reply,for:job.id) {
+            case .pending?, .sending?, .sent?: return .waiting
+            case .failed?, nil: return .replied
+            }
+        }
+        if job.state == "sent" { return .waiting }
+        if job.state == "failed" { return .failed }
+        return .local
     }
     @discardableResult func rememberNew(_ r: Recording, force: Bool = false) -> Bool {
         let route = r.dialogueRoute
@@ -331,6 +376,11 @@ final class NStackTransfers: ObservableObject {
         }
         jobs[i].state = currentSigner == nil ? "paused_locked" : currentSigner != jobs[i].destination.signer ? "paused_identity" : !allowed ? "paused_capture_or_background" : "queued"; jobs[i].notice = nil
         do { try persist() } catch { notice = error.localizedDescription }; resume()
+    }
+    func sendPendingConversation(_ id: UUID) {
+        guard let job = jobs.first(where:{$0.id == id}),
+              !["uploading","posting","background_uploading"].contains(job.state) else { return }
+        retry(id)
     }
     func cancel(_ id: UUID) {
         guard let i = jobs.firstIndex(where: { $0.id == id }), jobs[i].state != "sent" else { return }
@@ -560,7 +610,7 @@ final class NStackTransfers: ObservableObject {
                 replyNotice = nil
                 return inserted ? newest : nil
             }
-            replyNotice = "No new reply yet. Pull to refresh or tap Refresh reply while the app is in the foreground."
+            replyNotice = "No new reply yet. Pull to refresh or tap the refresh icon while the app is in the foreground."
         } catch {
             if !Task.isCancelled { replyNotice = error.localizedDescription }
         }
@@ -589,6 +639,15 @@ final class NStackTransfers: ObservableObject {
     }
     func refreshAndPlayReply(for jobID: UUID) async {
         if let reply = await refreshReply(for:jobID) { autoPlayReplyIfNeeded(reply,for:jobID) }
+    }
+    func refreshRecentReplies() async {
+        var played = false
+        for job in recentConversationJobs where job.state == "sent" && job.threadID != nil {
+            if let reply = await refreshReply(for:job.id), !played {
+                autoPlayReplyIfNeeded(reply,for:job.id)
+                played = true
+            }
+        }
     }
     func claimReplyPlayback(_ reply: DialogueReply, for jobID: UUID) -> Bool {
         guard let conversation = jobs.first(where:{$0.id == jobID})?.conversationID,
