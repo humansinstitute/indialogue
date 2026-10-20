@@ -5,8 +5,8 @@ final class RecorderSmokeTests: XCTestCase {
         XCTAssertTrue(app.navigationBars["In Dialogue"].waitForExistence(timeout: 10))
         XCTAssertTrue(app.buttons["recordButton"].exists)
         XCTAssertTrue(app.buttons["microphoneControl"].exists)
-        XCTAssertFalse(app.segmentedControls["dialogueMode"].exists)
-        XCTAssertTrue(app.buttons["routeSettings"].exists)
+        XCTAssertTrue(app.segmentedControls["dialogueMode"].exists)
+        XCTAssertFalse(app.buttons["routeSettings"].exists)
         XCTAssertTrue(app.buttons["recordButton"].label.contains("New recording"))
         XCTAssertFalse(app.staticTexts.matching(NSPredicate(format:"label CONTAINS %@", "Use only when it is safe")).firstMatch.exists)
         XCTAssertFalse(app.buttons["Find available microphones"].exists)
@@ -25,6 +25,21 @@ final class RecorderSmokeTests: XCTestCase {
         XCTAssertTrue(app.secureTextFields["Create PIN (4–12 digits)"].exists)
         app.terminate(); app.launch()
         XCTAssertTrue(app.buttons["recordButton"].waitForExistence(timeout: 10))
+    }
+}
+
+extension RecorderSmokeTests {
+    func testConversationUsesLargeStatusAndRecordControlsWithoutRecipientHeadline() {
+        let app = XCUIApplication(); app.launchArguments = ["--synthetic-conversation"]; app.launch()
+        XCTAssertTrue(app.otherElements["recentConversations"].waitForExistence(timeout:10))
+        let statusButtons = app.buttons.matching(identifier:"conversationPlayStatus")
+        let recordButtons = app.buttons.matching(identifier:"conversationRecord")
+        XCTAssertEqual(statusButtons.count,2)
+        XCTAssertEqual(recordButtons.count,2)
+        XCTAssertGreaterThan(statusButtons.element(boundBy:0).frame.width,100)
+        XCTAssertGreaterThan(recordButtons.element(boundBy:0).frame.width,100)
+        XCTAssertFalse(app.staticTexts["Rick"].exists)
+        let shot = XCTAttachment(screenshot:app.screenshot()); shot.name = "Large conversation play and record controls"; shot.lifetime = .keepAlways; add(shot)
     }
 }
 

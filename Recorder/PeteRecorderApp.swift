@@ -25,6 +25,25 @@ struct PeteRecorderApp: App {
             _model = StateObject(wrappedValue: model)
             return
         }
+        if ProcessInfo.processInfo.arguments.contains("--synthetic-conversation") {
+            let root = FileManager.default.temporaryDirectory.appendingPathComponent("UIConversation-" + UUID().uuidString)
+            let transferRoot = root.deletingLastPathComponent()
+                .appendingPathComponent(root.lastPathComponent + "-transfers")
+            let destination = NStackDestination(
+                origin:"https://example.invalid", signer:"synthetic-signer", workspace:UUID().uuidString,
+                workspaceLabel:"Synthetic", appNpub:"synthetic-app", channel:UUID().uuidString,
+                channelLabel:"Rick", recipient:nil, recipientLabel:nil,
+                prompt:"Please review this recording.", automatic:false
+            )
+            var waiting = TransferJob(recordingID:UUID(),destination:destination,title:"Waiting",body:"",createdAt:Date().addingTimeInterval(-120),files:[],conversationID:UUID())
+            waiting.state = "sent"; waiting.threadID = "synthetic-thread"
+            let local = TransferJob(recordingID:UUID(),destination:destination,title:"Local",body:"",createdAt:Date().addingTimeInterval(-30),files:[],conversationID:UUID())
+            try? FileManager.default.createDirectory(at:transferRoot,withIntermediateDirectories:true)
+            try? JSONEncoder().encode(NStackTransfers.Ledger(jobs:[waiting,local],intents:[],destination:destination))
+                .write(to:transferRoot.appendingPathComponent("ledger.json"),options:.atomic)
+            _model = StateObject(wrappedValue:RecorderModel(root:root))
+            return
+        }
         if ProcessInfo.processInfo.arguments.contains("--synthetic-review") {
             let root = FileManager.default.temporaryDirectory.appendingPathComponent("UIReview-" + UUID().uuidString)
             let model = RecorderModel(root: root)
@@ -74,24 +93,34 @@ struct RecorderView: View {
             ScrollView {
                 VStack(spacing: 28) {
                 Spacer()
-                VStack(alignment:.leading,spacing:10) {
-                    Button { routeOpen = true } label: {
-                        HStack {
-                            VStack(alignment:.leading,spacing:3) {
-                                Text(routeSummary).font(.headline)
-                                Text("Choose destination and instructions").font(.caption)
-                            }
-                            Spacer(); Image(systemName:"chevron.right")
-                        }.frame(maxWidth:.infinity).padding(.vertical,8)
-                    }.buttonStyle(.bordered).accessibilityIdentifier("routeSettings")
+                Picker("Conversation profile", selection: Binding(
+                    get: { transfers.routing.mode },
+                    set: { mode in
+                        do { try transfers.setMode(mode) }
+                        catch { model.report(error) }
+                    }
+                )) {
+                    ForEach(DialogueMode.allCases) { Text($0.rawValue).tag($0) }
                 }
+                .pickerStyle(.segmented)
+                .accessibilityIdentifier("dialogueMode")
                 Button { micOpen = true; Task { await model.prepareInputs() } } label: {
-                    VStack(spacing: 8) {
-                        Image(systemName: "mic.fill").font(.largeTitle)
-                        Text(model.actualInput).font(.headline)
-                        Text(model.preferredInputAvailable == false ? "Saved microphone unavailable · tap to choose" : "Current microphone · tap to choose").font(.caption)
-                    }.frame(maxWidth: .infinity).padding()
-                }.buttonStyle(.bordered).accessibilityIdentifier("microphoneControl").disabled(model.busy)
+                    HStack(spacing:8) {
+                        Image(systemName:"mic.fill")
+                        VStack(alignment:.leading,spacing:1) {
+                            Text(model.actualInput).font(.caption.weight(.semibold)).lineLimit(1)
+                            Text(model.preferredInputAvailable == false ? "Saved microphone unavailable · System default" : "Tap to choose microphone")
+                                .font(.caption2).lineLimit(1)
+                        }
+                    }
+                    .frame(maxWidth:.infinity)
+                    .padding(.vertical,3)
+                    .foregroundStyle(activeMicrophoneSelected ? Color.accentColor : Color.secondary)
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+                .accessibilityIdentifier("microphoneControl")
+                .disabled(model.busy)
                 if model.active != nil {
                     CaptureLevelView(levels: model.levels)
                     Text(Duration.seconds(model.elapsed).formatted(.time(pattern: .hourMinuteSecond)))
@@ -169,16 +198,8 @@ struct RecorderView: View {
             IdentityUnlock(model: identity) { unlockOpen = false; refreshTransfers() }
         }
     }
-    func routeConfigured(_ mode: DialogueMode) -> Bool {
-        switch mode { case .normal: transfers.destination != nil; case .channel: transfers.routing.channel != nil; case .agent: transfers.routing.agent != nil }
-    }
-    var routeSummary: String {
-        let mode = transfers.routing.mode
-        let d = transfers.routing.destination(normal:transfers.destination)
-        guard let d else { return "Set up \(mode.rawValue)" }
-        if mode == .normal { return "Normal · \(d.channelLabel)" }
-        if mode == .agent { return "Agent · \(d.recipientLabel ?? "Choose agent")" }
-        return "Channel · \(d.channelLabel)"
+    var activeMicrophoneSelected: Bool {
+        !["No active input", "Microphone inactive"].contains(model.actualInput)
     }
     var conversations: some View {
         DisclosureGroup(isExpanded:$conversationsExpanded) {
@@ -187,7 +208,7 @@ struct RecorderView: View {
             }.padding(.top,6)
         } label: {
             HStack {
-                Text("Recent conversations").font(.headline)
+                Text("Conversation").font(.headline).foregroundStyle(.primary)
                 Spacer()
                 Button { Task { await transfers.refreshRecentReplies() } } label: {
                     Image(systemName:"arrow.clockwise")
@@ -208,39 +229,53 @@ struct RecorderView: View {
             && renameTarget == nil && deleteTarget == nil && downloadTarget == nil && !criticalNotice
         let poll = ReplyPollingKey(jobID:job.id,active:job.id == transfers.latestConversationJob?.id && scenePhase == .active && model.active == nil && unobscured,signer:identity.npub)
         let status = transfers.conversationStatus(for:job)
+        let reply = job.conversationID.flatMap { transfers.replies[$0] }
+        let followupRoute = transfers.followupRoute(for:job)
         return VStack(alignment:.leading,spacing:6) {
-            HStack(spacing:10) {
+            Text(job.createdAt,style:.relative).font(.caption).foregroundStyle(.secondary)
+            HStack(spacing:8) {
                 Button {
                     if status == .local || status == .failed { transfers.sendPendingConversation(job.id) }
+                    else if let reply { transfers.toggleReplyPlayback(reply,for:job.id) }
                 } label: {
-                    Image(systemName:statusIcon(status))
-                        .foregroundStyle(statusColor(status))
-                        .frame(width:44,height:44)
+                    ZStack(alignment:.bottomTrailing) {
+                        Image(systemName:replyPlaybackIcon(reply:reply))
+                            .font(.title2.bold())
+                            .foregroundStyle(.white)
+                            .frame(maxWidth:.infinity,minHeight:48)
+                            .background(statusColor(status),in:RoundedRectangle(cornerRadius:10))
+                        Image(systemName:statusBadgeIcon(status))
+                            .font(.caption2.bold())
+                            .foregroundStyle(.white)
+                            .padding(6)
+                    }
                 }
                 .buttonStyle(.plain)
-                .disabled(status == .waiting || status == .replied)
+                .disabled(status == .waiting)
                 .accessibilityLabel(statusLabel(status))
-                .accessibilityHint(status == .local || status == .failed ? "Sends this recording to its saved destination" : "")
-                VStack(alignment:.leading,spacing:2) {
-                    Text(job.destination.recipientLabel ?? job.destination.channelLabel).font(.headline).lineLimit(1)
-                    Text(job.createdAt,style:.relative).font(.caption).foregroundStyle(.secondary)
+                .accessibilityHint(status == .local || status == .failed ? "Sends this recording to its saved destination" : status == .replied ? "Plays the latest reply" : "")
+                .accessibilityIdentifier("conversationPlayStatus")
+
+                Button {
+                    guard var route = followupRoute else { return }
+                    route.respondingToReplyID = reply?.id
+                    Task { await model.start(route:route) }
+                } label: {
+                    Image(systemName:"mic.fill")
+                        .font(.title2.bold())
+                        .foregroundStyle(.white)
+                        .frame(maxWidth:.infinity,minHeight:48)
+                        .background(Color.blue,in:RoundedRectangle(cornerRadius:10))
                 }
-                Spacer()
-                if let conversation = job.conversationID, let reply = transfers.replies[conversation] {
-                    Button { transfers.toggleReplyPlayback(reply,for:job.id) } label: {
-                        Image(systemName:transfers.playingReplyID == reply.id ? "stop.fill" : "play.fill").frame(width:44,height:44)
-                    }.buttonStyle(.plain).accessibilityLabel(transfers.playingReplyID == reply.id ? "Stop reply" : "Play reply")
-                    Button {
-                        if let route = transfers.followupRoute(for:job) {
-                            Task { var route = route; route.respondingToReplyID = reply.id; await model.start(route:route) }
-                        }
-                    } label: { Image(systemName:"mic.fill").frame(width:44,height:44) }
-                    .buttonStyle(.plain).foregroundStyle(.blue).accessibilityLabel("Respond")
-                }
+                .buttonStyle(.plain)
+                .disabled(followupRoute == nil)
+                .accessibilityLabel("Record response")
+                .accessibilityHint("Starts a recording in this conversation")
+                .accessibilityIdentifier("conversationRecord")
             }
             if let conversation = job.conversationID, let reply = transfers.replies[conversation] {
                 let responseStatus = transfers.responseStatus(to:reply,for:job.id)
-                DisclosureGroup("Reply from \(reply.sender)") {
+                DisclosureGroup("Show reply") {
                     Text(reply.body).frame(maxWidth:.infinity,alignment:.leading).accessibilityIdentifier("replyText")
                     if case .failed(let notice) = responseStatus {
                         if let notice { Text(notice).font(.footnote).foregroundStyle(.secondary) }
@@ -257,8 +292,17 @@ struct RecorderView: View {
                 await transfers.pollReplies(for:job.id)
             }
     }
-    func statusIcon(_ status: ConversationDeliveryStatus) -> String {
-        switch status { case .local:return "paperplane"; case .waiting:return "clock.fill"; case .replied:return "checkmark.circle.fill"; case .failed:return "exclamationmark.arrow.triangle.2.circlepath" }
+    func replyPlaybackIcon(reply: DialogueReply?) -> String {
+        if let reply, transfers.playingReplyID == reply.id { return "stop.fill" }
+        return "play.fill"
+    }
+    func statusBadgeIcon(_ status: ConversationDeliveryStatus) -> String {
+        switch status {
+        case .local: return "paperplane.fill"
+        case .waiting: return "clock.fill"
+        case .replied: return "checkmark.circle.fill"
+        case .failed: return "exclamationmark.triangle.fill"
+        }
     }
     func statusColor(_ status: ConversationDeliveryStatus) -> Color {
         switch status { case .local:return .gray; case .waiting:return .orange; case .replied:return .green; case .failed:return .gray }
