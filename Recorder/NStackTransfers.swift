@@ -114,6 +114,8 @@ final class NStackTransfers: ObservableObject {
     private(set) var replyRefreshJobID: UUID?
     private var replyPlayer: AVAudioPlayer?
     private let speech = AVSpeechSynthesizer()
+    let replyVoice: ReplyVoice
+    private let speakReply: ((AVSpeechUtterance) -> Void)?
     private let defaults: UserDefaults
     static let defaultRecentConversationLimit = 5
     static let recentConversationLimitRange = 1...50
@@ -143,9 +145,11 @@ final class NStackTransfers: ObservableObject {
             replyStates = try c.decodeIfPresent([UUID:DialogueReplyState].self,forKey:.replyStates) ?? [:]
         }
     }
-    init(root: URL, defaults providedDefaults: UserDefaults? = nil) {
+    init(root: URL, defaults providedDefaults: UserDefaults? = nil, speakReply: ((AVSpeechUtterance) -> Void)? = nil) {
         self.root = root
+        self.speakReply = speakReply
         defaults = providedDefaults ?? .standard
+        replyVoice = ReplyVoice(defaults: providedDefaults ?? .standard)
         recentConversationLimit = Self.validatedRecentConversationLimit(
             defaults.object(forKey: Self.recentConversationLimitKey)
         )
@@ -704,10 +708,10 @@ final class NStackTransfers: ObservableObject {
                 } catch { playingReplyID = nil; replyNotice = error.localizedDescription }
             }
         } else {
-            let utterance = AVSpeechUtterance(string:reply.body)
-            utterance.voice = AVSpeechSynthesisVoice(language:Locale.current.language.languageCode?.identifier)
+            let utterance = replyVoice.utterance(reply.body)
             speech.delegate = playbackDelegate
-            speech.speak(utterance)
+            if let speakReply { speakReply(utterance) }
+            else { speech.speak(utterance) }
         }
     }
     func stopReply() { replyPlayer?.stop(); replyPlayer = nil; speech.stopSpeaking(at:.immediate); playingReplyID = nil }

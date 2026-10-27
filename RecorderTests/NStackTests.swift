@@ -926,3 +926,31 @@ extension NStackTests {
         }
     }
 }
+
+extension NStackTests {
+    func testSavedVoiceDoesNotOverrideAttachedReplyAudio() async throws {
+        let root = temp(); defer { try? FileManager.default.removeItem(at: root) }
+        let suite = "ReplyAudioPriority." + UUID().uuidString
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        var job = TransferJob(recordingID: UUID(), destination: destination(), title: "Synthetic", body: "", files: [])
+        job.state = "sent"
+        try JSONEncoder().encode(NStackTransfers.Ledger(jobs: [job], intents: [], destination: job.destination))
+            .write(to: root.appendingPathComponent("ledger.json"))
+        var spoken = false
+        let transfers = NStackTransfers(root: root, defaults: defaults, speakReply: { _ in spoken = true })
+        transfers.replyVoice.select("saved.voice")
+        let downloaded = expectation(description: "Attached audio requested")
+        MockNStackProtocol.handler = { request in
+            XCTAssertTrue(request.url!.path.hasSuffix("/storage/attached-audio/content"))
+            downloaded.fulfill()
+            return (403, [:]) // No physical audio or speech; the existing failure remains visible.
+        }
+        transfers.setAvailability(active: true, signer: job.destination.signer, api: api())
+        transfers.toggleReplyPlayback(DialogueReply(id: "audio-reply", body: "Text", sender: "Test", createdAt: nil, audioObjectID: "attached-audio"), for: job.id)
+        await fulfillment(of: [downloaded], timeout: 3)
+        XCTAssertFalse(spoken)
+        transfers.stopReply()
+    }
+}

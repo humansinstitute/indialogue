@@ -160,3 +160,22 @@ extension RecorderSmokeTests {
         XCTAssertTrue(app.staticTexts["Deletes local recordings, audio, transcripts and finished local upload copies. Uploaded workspace copies remain."].exists)
     }
 }
+
+extension RecorderSmokeTests {
+    func testReplyVoiceSelectorAndPreviewWithoutCapture() {
+        let app = XCUIApplication(); app.launchArguments = ["--synthetic-review"]; app.launch()
+        XCTAssertTrue(app.buttons["menuButton"].waitForExistence(timeout: 10))
+        app.buttons["menuButton"].tap()
+        app.buttons["Reply voice"].tap()
+        XCTAssertTrue(app.navigationBars["Reply voice"].waitForExistence(timeout: 5))
+        XCTAssertTrue(app.buttons["replyVoicePicker"].exists)
+        XCTAssertTrue(app.buttons["previewReplyVoice"].isEnabled)
+        app.buttons["previewReplyVoice"].tap()
+        app.buttons["Stop preview"].tap()
+        let shot = XCTAttachment(screenshot: app.screenshot())
+        shot.name = "Native reply voice settings"; shot.lifetime = .keepAlways; add(shot)
+        app.buttons["replyVoicePicker"].tap()
+        XCTAssertTrue(app.buttons["System Default"].waitForExistence(timeout: 5))
+        app.buttons["System Default"].tap()
+    }
+}

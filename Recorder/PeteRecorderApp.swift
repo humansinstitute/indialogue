@@ -348,6 +348,7 @@ struct RecorderView: View {
                     NavigationLink("NStack") { NStackSettings(transfers:transfers,identity:identity) }
                     NavigationLink("NStack uploads") { NStackHistory(transfers:transfers) }
                     NavigationLink("Identity") { IdentitySettings(model: identity) }
+                    NavigationLink("Reply voice") { ReplyVoiceSettings(voice: transfers.replyVoice, model: model) }
                     NavigationLink("Settings") { RecordingRetentionSettings(model: model) }
                     NavigationLink("Vocabulary") { VocabularySettings(model: model) }
                     NavigationLink("Notices and status") {

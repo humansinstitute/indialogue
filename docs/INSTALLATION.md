@@ -54,3 +54,9 @@ Use the existing Apple Distribution identity, team and App Store Connect app for
 3. Wait for App Store Connect processing, confirm build 12 appears under TestFlight, then add it to the existing private internal tester group. Apple agreements, export-compliance questions or interactive approval remain owner actions.
 
 For unattended release, an App Store Connect API key may authenticate `xcodebuild -exportArchive`/upload, but its private key, key ID, issuer ID, team ID, profile UUIDs and raw logs must stay outside this repository under ignored operational evidence. A successful archive is not TestFlight availability: record upload success and App Store Connect build readback. If an App Store provisioning profile cannot be resolved, stop after the archive and report that exact profile/App Store Connect action; do not use a development or wildcard profile for TestFlight.
+
+## Reply voice update — version 1.3 build 15
+
+Build 15 adds Menu → Reply voice for native iPhone text reply speech. Keep the existing bundle ID, signing team, Keychain and app data for an in-place update. Rebuild the reviewed commit using the generic-device command above; an unsigned build is validation only. Rick/manager owns signing with the existing profile and installation or TestFlight distribution. For TestFlight, use build **15** in the archive/upload steps above. Do not uninstall, reset storage, or launch a phone sample/test as part of preparation.
+
+Choose a listed voice or System Default; selections save immediately. Preview speaks a short sample and is disabled during recording, busy work and local recording playback. Leaving the screen or backgrounding stops the preview. Attached audio retains playback priority. If iOS removes the saved voice, text uses System Default while preserving the selection for when it becomes available again.
