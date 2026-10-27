@@ -364,6 +364,14 @@ struct RecorderView: View {
                         }.navigationTitle("Notices and status")
                     }
                 }
+                Section("Diagnostics") {
+                    if let destination = transfers.diagnosticsDestinationLabel { Text(destination).font(.footnote) }
+                    Button("Send diagnostics") { model.sendDiagnostics() }
+                        .accessibilityIdentifier("sendDiagnostics")
+                    Text("Manually sends the last hour of operational events to the configured NStack channel as a private JSON report. No audio, transcript or message content. Unlock the matching identity first. Pending reports survive relaunch; retry in NStack uploads.").font(.footnote)
+                    if let status = transfers.diagnosticsStatus { Text(status).textSelection(.enabled) }
+                    if let notice = model.diagnosticsNotice { Text(notice).accessibilityIdentifier("diagnosticsNotice") }
+                }
                 Section("Recordings · \(model.recordings.count)") {
                     if model.recordings.isEmpty { Text("No saved recordings.") }
                     ForEach(model.recordings) { r in

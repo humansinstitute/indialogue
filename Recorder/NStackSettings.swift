@@ -172,6 +172,9 @@ struct NStackHistory: View {
                     Text("\(job.destination.workspaceLabel) → \(job.destination.channelLabel)")
                     Text(job.state.replacingOccurrences(of:"_",with:" "))
                     if let notice = job.notice { Text(notice).font(.footnote) }
+                    if job.diagnostics == true, job.state == "sent", let object = job.files.first?.objectID {
+                        Text("Report: storage://" + object).font(.footnote).textSelection(.enabled)
+                    }
                     if let id = job.messageID { Text("Message: " + id).font(.footnote).textSelection(.enabled) }
                     if !["sent","cancelled"].contains(job.state) {
                         Button("Retry same snapshot") { transfers.retry(job.id) }

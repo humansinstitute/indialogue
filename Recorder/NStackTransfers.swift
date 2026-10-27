@@ -65,6 +65,7 @@ struct TransferJob: Codable, Identifiable, Equatable {
     var conversationID: UUID?
     var dialogueMode: DialogueMode?
     var respondingToReplyID: String?
+    var diagnostics: Bool?
 }
 struct AutomaticUploadIntent: Codable {
     let recordingID: UUID
@@ -102,6 +103,7 @@ final class NStackTransfers: ObservableObject {
     @Published var notice: String?
     private(set) var intents: [AutomaticUploadIntent] = []
     let root: URL
+    let diagnosticsLog: DiagnosticsLog
     private var readable = true
     private var worker: Task<Void, Never>?
     private var allowed = false
@@ -122,6 +124,7 @@ final class NStackTransfers: ObservableObject {
     static let recentConversationLimitKey = "recentConversationLimit"
     private lazy var playbackDelegate = ReplyPlaybackDelegate { [weak self] in
         Task { @MainActor in
+            self?.diagnosticsLog.record(.playbackFinished)
             self?.replyPlayer = nil
             self?.playingReplyID = nil
         }
@@ -147,6 +150,7 @@ final class NStackTransfers: ObservableObject {
     }
     init(root: URL, defaults providedDefaults: UserDefaults? = nil, speakReply: ((AVSpeechUtterance) -> Void)? = nil) {
         self.root = root
+        diagnosticsLog = DiagnosticsLog(root:root.appendingPathComponent("Diagnostics"))
         self.speakReply = speakReply
         defaults = providedDefaults ?? .standard
         replyVoice = ReplyVoice(defaults: providedDefaults ?? .standard)
@@ -327,6 +331,49 @@ final class NStackTransfers: ObservableObject {
         intents.removeAll { $0.recordingID == r.id }
         try persist(); resume()
     }
+    /// A separate report job: no Recording, transcript, prompt, agent mention or conversation.
+    func enqueueDiagnostics(snapshot: RecorderDiagnosticSnapshot) throws {
+        guard worker == nil, !reconcilingBackgroundTasks else { throw DiagnosticsError.busy }
+        guard readable, var d = routing.destination(normal:destination) else { throw NStackError.invalidSetup }
+        guard currentSigner == d.signer else { throw NStackError.invalidSetup }
+        d.recipient = nil; d.recipientLabel = nil; d.prompt = "Operational diagnostics"; d.automatic = false
+        try d.validate()
+        // Bound report snapshots as well as the event log. Never discard pending reports.
+        let reports = jobs.filter { $0.diagnostics == true }
+        guard !reports.contains(where: { !["sent","cancelled"].contains($0.state) }) else { throw DiagnosticsError.pending }
+        // Also remove report-only orphans left by termination before ledger commit.
+        let pendingIDs = Set(jobs.filter { $0.diagnostics == true && !["sent","cancelled"].contains($0.state) }.map { $0.id.uuidString })
+        for directory in try FileManager.default.contentsOfDirectory(at:root,includingPropertiesForKeys:nil) {
+            guard !pendingIDs.contains(directory.lastPathComponent),
+                  FileManager.default.fileExists(atPath:directory.appendingPathComponent("diagnostics.json").path) else { continue }
+            try FileManager.default.removeItem(at:directory)
+        }
+        jobs.removeAll { $0.diagnostics == true }
+        let data = try diagnosticsLog.report(snapshot:snapshot)
+        let id = UUID()
+        // Use the job ID for the immutable snapshot path, as ordinary transfers do.
+        let target = root.appendingPathComponent(id.uuidString)
+        do {
+            try FileManager.default.createDirectory(at:target,withIntermediateDirectories:true)
+            try data.write(to:target.appendingPathComponent("diagnostics.json"),options:[.atomic,.completeFileProtectionUntilFirstUserAuthentication])
+        } catch { try? FileManager.default.removeItem(at:target); throw error }
+        let job = TransferJob(id:id,recordingID:id,destination:d,title:"In Dialogue diagnostics",
+            body:"In Dialogue operational diagnostics. Private JSON report attached; no audio or message content.",
+            files:[TransferFile(name:"diagnostics.json",mime:"application/json",size:data.count,checksum:NostrCodec.hash(data))],diagnostics:true)
+        jobs.append(job)
+        do { try persist() } catch { jobs.removeLast(); try? FileManager.default.removeItem(at:target); throw error }
+        resume()
+    }
+    var diagnosticsDestinationLabel: String? {
+        routing.destination(normal:destination).map { $0.workspaceLabel + " → " + $0.channelLabel }
+    }
+    var diagnosticsStatus: String? {
+        guard let job = jobs.last(where:{$0.diagnostics == true}) else { return nil }
+        if job.state == "sent", let object = job.files.first?.objectID {
+            return "Diagnostics sent to \(job.destination.channelLabel). Report: storage://\(object)"
+        }
+        return "Diagnostics: \(job.state). Use NStack uploads to retry or cancel."
+    }
     func setAvailability(active: Bool, signer: String?, api: NStackAPI) {
         self.api = api; currentSigner = signer; allowed = active && signer != nil
         api.backgroundUploads.onEvents = { [weak self] in
@@ -378,6 +425,7 @@ final class NStackTransfers: ObservableObject {
                 jobs[i].files[file].backgroundTaskDescription = nil
             }
         }
+        diagnosticsLog.record(.deliveryRetry)
         jobs[i].state = currentSigner == nil ? "paused_locked" : currentSigner != jobs[i].destination.signer ? "paused_identity" : !allowed ? "paused_capture_or_background" : "queued"; jobs[i].notice = nil
         do { try persist() } catch { notice = error.localizedDescription }; resume()
     }
@@ -401,6 +449,7 @@ final class NStackTransfers: ObservableObject {
             while let i = jobs.firstIndex(where: { $0.state == "queued" && $0.destination.signer == currentSigner }), allowed, !Task.isCancelled {
                 do { try await send(i, api:api) }
                 catch {
+                    diagnosticsLog.record(.deliveryFailed, interrupted:Task.isCancelled, reason:DiagnosticReason.failure(error))
                     if jobs[i].state != "cancelled" {
                         jobs[i].state = Task.isCancelled ? (currentSigner == nil ? "paused_locked" : allowed ? "queued" : "paused_capture_or_background") : "failed"
                         jobs[i].notice = Task.isCancelled ? "Finalization was interrupted and will resume safely when execution is available." : error.localizedDescription
@@ -413,6 +462,7 @@ final class NStackTransfers: ObservableObject {
     }
     private func send(_ i: Int, api: NStackAPI) async throws {
         let d = jobs[i].destination
+        diagnosticsLog.record(.deliveryAttempt, count:jobs[i].attempts + 1)
         jobs[i].attempts += 1; jobs[i].lastAttempt = Date(); jobs[i].state = "uploading"; try persist()
         for f in jobs[i].files.indices {
             try Task.checkCancellation()
@@ -454,12 +504,14 @@ final class NStackTransfers: ObservableObject {
                 try StorageMetadata.validateCompleted(readback, file: file)
             }
             jobs[i].files[f].complete = true; try persist()
+            diagnosticsLog.record(.storageComplete)
         }
         try Task.checkCancellation(); jobs[i].state = "posting"; try persist()
         let response = try await api.request(origin:d.origin,path:"/api/v4/flightdeck-pg/workspaces/\(d.workspace)/channels/\(d.channel)/messages",app:d.appNpub,method:"POST",body:api.message(jobs[i]))
         guard let message = response["message"] as? [String:Any], let id = message["id"] as? String else { throw NStackError.malformed }
         jobs[i].messageID = id; jobs[i].threadID = (response["thread"] as? [String:Any])?["id"] as? String ?? message["thread_id"] as? String
         jobs[i].state = "sent"; jobs[i].notice = nil
+        diagnosticsLog.record(.deliverySent)
         if let conversation = jobs[i].conversationID, let replyID = jobs[i].respondingToReplyID {
             var replyState = replyStates[conversation] ?? DialogueReplyState()
             replyState.lastRespondedID = replyID
@@ -500,6 +552,7 @@ final class NStackTransfers: ObservableObject {
                 jobs[job].state = resumableState(for:jobs[job])
                 jobs[job].notice = jobs[job].state == "queued" ? nil : "File transfer finished; unlock the matching identity to finalize delivery."
             } else {
+                diagnosticsLog.record(.deliveryFailed, reason:.offline)
                 jobs[job].state = "failed"
                 let detail = event.errorDescription ?? event.statusCode.map { "HTTP \($0)" } ?? "unknown response"
                 jobs[job].notice = "Background file transfer was interrupted (\(detail)). Retry uses the same saved object and upload URL."
@@ -583,6 +636,7 @@ final class NStackTransfers: ObservableObject {
               currentSigner == job.destination.signer, let thread = job.threadID,
               let conversation = job.conversationID else { replyNotice = "Replies refresh only in the foreground with the matching identity unlocked."; return nil }
         guard beginReplyRefresh(for:jobID) else { return nil }
+        diagnosticsLog.record(.replyRefresh)
         defer { finishReplyRefresh(for:jobID) }
         do {
             let base = "/api/v4/flightdeck-pg/workspaces/\(job.destination.workspace)/channels/\(job.destination.channel)/messages"
@@ -610,12 +664,14 @@ final class NStackTransfers: ObservableObject {
             try Task.checkCancellation()
             guard allowed, currentSigner == job.destination.signer else { return nil }
             if let newest {
+                diagnosticsLog.record(.replyReceived)
                 let inserted = storeReply(newest,for:conversation)
                 replyNotice = nil
                 return inserted ? newest : nil
             }
             replyNotice = "No new reply yet. Pull to refresh or tap the refresh icon while the app is in the foreground."
         } catch {
+            diagnosticsLog.record(.replyFailed, interrupted:Task.isCancelled, reason:DiagnosticReason.failure(error))
             if !Task.isCancelled { replyNotice = error.localizedDescription }
         }
         return nil
@@ -697,6 +753,7 @@ final class NStackTransfers: ObservableObject {
     }
     private func startReplyPlayback(_ reply: DialogueReply, for jobID: UUID) {
         stopReply(); playingReplyID = reply.id
+        diagnosticsLog.record(.playbackStart)
         if let object = reply.audioObjectID, let job = jobs.first(where:{$0.id == jobID}), let api, allowed {
             Task {
                 do {
@@ -705,7 +762,7 @@ final class NStackTransfers: ObservableObject {
                     replyPlayer = try AVAudioPlayer(data:data)
                     replyPlayer?.delegate = playbackDelegate
                     guard replyPlayer?.play() == true else { throw NStackError.malformed }
-                } catch { playingReplyID = nil; replyNotice = error.localizedDescription }
+                } catch { diagnosticsLog.record(.playbackFailed, reason:DiagnosticReason.failure(error)); playingReplyID = nil; replyNotice = error.localizedDescription }
             }
         } else {
             let utterance = replyVoice.utterance(reply.body)
@@ -714,7 +771,7 @@ final class NStackTransfers: ObservableObject {
             else { speech.speak(utterance) }
         }
     }
-    func stopReply() { replyPlayer?.stop(); replyPlayer = nil; speech.stopSpeaking(at:.immediate); playingReplyID = nil }
+    func stopReply() { if playingReplyID != nil { diagnosticsLog.record(.playbackStop) }; replyPlayer?.stop(); replyPlayer = nil; speech.stopSpeaking(at:.immediate); playingReplyID = nil }
 }
 
 private final class ReplyPlaybackDelegate: NSObject, AVAudioPlayerDelegate, AVSpeechSynthesizerDelegate {

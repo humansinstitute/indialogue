@@ -179,3 +179,17 @@ extension RecorderSmokeTests {
         app.buttons["System Default"].tap()
     }
 }
+
+
+extension RecorderSmokeTests {
+    func testManualDiagnosticsWithoutSetupShowsVisibleFailureWithoutCapture() {
+        let app = XCUIApplication(); app.launchArguments = ["--synthetic-retention"]; app.launch()
+        XCTAssertTrue(app.buttons["menuButton"].waitForExistence(timeout:10)); app.buttons["menuButton"].tap()
+        let send = app.buttons["sendDiagnostics"]
+        for _ in 0..<3 where !send.isHittable { app.swipeUp() }
+        XCTAssertTrue(send.isHittable); send.tap()
+        XCTAssertTrue(app.staticTexts["diagnosticsNotice"].waitForExistence(timeout:5))
+        XCTAssertFalse(app.staticTexts.matching(NSPredicate(format:"label BEGINSWITH %@","Diagnostics sent")).firstMatch.exists)
+        let screenshot = XCTAttachment(screenshot:app.screenshot()); screenshot.name = "Manual diagnostics setup notice"; screenshot.lifetime = .keepAlways; add(screenshot)
+    }
+}

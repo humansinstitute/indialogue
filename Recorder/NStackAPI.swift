@@ -178,9 +178,12 @@ final class NStackAPI {
         var body: [String: Any] = ["body":job.body,"client_request_id":job.id.uuidString,
             "message_signature":["version":1,"protocol":"flightdeck_pg_message_instruction","kind":33358,"signer_npub":d.signer,"body_sha256":hash,"nostr_event":encoded],
             "metadata":["attachments":job.files.map { ["kind":"file","storage_object_id":$0.objectID ?? "","filename":$0.name,"mime_type":$0.mime,"size_bytes":$0.size] as [String:Any] },"recorder":["recording_id":job.recordingID.uuidString,"snapshot_id":job.id.uuidString,"version":1]]]
+        if job.diagnostics == true {
+            body["metadata"] = ["attachments":job.files.map { ["kind":"file","storage_object_id":$0.objectID ?? "","filename":$0.name,"mime_type":$0.mime,"size_bytes":$0.size] as [String:Any] },"diagnostics":["schema_version":1,"report_id":job.id.uuidString]]
+        }
         if let thread = job.threadID { body["thread_id"] = thread }
         else { body["create_thread"] = true; body["thread_title"] = String(job.title.prefix(120)) }
-        if let recipient = d.recipient { body["mentions"] = [["type":"agent","npub":recipient,"label":d.recipientLabel!]] }
+        if job.diagnostics != true, let recipient = d.recipient { body["mentions"] = [["type":"agent","npub":recipient,"label":d.recipientLabel!]] }
         return body
     }
 }

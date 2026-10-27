@@ -60,3 +60,17 @@ For unattended release, an App Store Connect API key may authenticate `xcodebuil
 Build 15 adds Menu → Reply voice for native iPhone text reply speech. Keep the existing bundle ID, signing team, Keychain and app data for an in-place update. Rebuild the reviewed commit using the generic-device command above; an unsigned build is validation only. Rick/manager owns signing with the existing profile and installation or TestFlight distribution. For TestFlight, use build **15** in the archive/upload steps above. Do not uninstall, reset storage, or launch a phone sample/test as part of preparation.
 
 Choose a listed voice or System Default; selections save immediately. Preview speaks a short sample and is disabled during recording, busy work and local recording playback. Leaving the screen or backgrounding stops the preview. Attached audio retains playback priority. If iOS removes the saved voice, text uses System Default while preserving the selection for when it becomes available again.
+
+## Diagnostics update — version 1.3 build 16
+
+Build 16 adds Menu → Send diagnostics and private JSON attachment delivery through the existing NStack destination. Review the full simulator results and generic device build before signing an in-place update. Preserve bundle ID/team, Keychain, recordings and pending uploads. No physical-iPad installation/support validation or TestFlight availability follows from an unsigned build; the current target remains iPhone-only.
+
+The release owner handles signing and physical review. An unsigned validation build is not a release. With existing App Store distribution signing resolved, prepare a release archive with:
+
+```sh
+xcodebuild -project Recorder.xcodeproj -scheme PeteRecorder -configuration Release \
+  -destination 'generic/platform=iOS' -archivePath tmp/docs/handoffs/InDialogue-1.3-16.xcarchive \
+  -skipPackagePluginValidation DEVELOPMENT_TEAM=YOUR_EXISTING_TEAM archive
+```
+
+Use Organizer → Distribute App → App Store Connect → Upload, then verify processed build **16** in App Store Connect before claiming TestFlight availability. Export/upload by CLI requires an owner-provided App Store export options plist and existing credentials; none are embedded or assumed here. Validate manual report attachment/reference, lock/offline/reopen recovery and actual capture continuity on the physical device before wider release.

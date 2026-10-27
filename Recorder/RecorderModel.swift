@@ -41,6 +41,7 @@ final class RecorderModel: NSObject, ObservableObject, AVAudioRecorderDelegate, 
     @Published var actualInput = "Microphone inactive"
     @Published var inputs: [AVAudioSessionPortDescription] = []
     @Published var message: String?
+    @Published var diagnosticsNotice: String?
     @Published var elapsed: Double = 0
     @Published var playing: UUID?
     @Published var busy = false
@@ -179,7 +180,7 @@ final class RecorderModel: NSObject, ObservableObject, AVAudioRecorderDelegate, 
             UserDefaults.standard.set(input.portName, forKey: "preferredInputName")
             refreshRoute()
             if var r = active { r.events.append("Input preference: \(input.portName); actual: \(actualInput)"); try persist(r); active = r }
-        } catch { report(error); if active != nil { stop(interrupted: true) } }
+        } catch { report(error); if active != nil { stop(interrupted: true, reason:.inputSelection) } }
     }
     func selectSystemInput() {
         do {
@@ -230,12 +231,13 @@ final class RecorderModel: NSObject, ObservableObject, AVAudioRecorderDelegate, 
                 }
                 try persist(started); active = started
             }
+            transfers.diagnosticsLog.record(.captureStart, route:diagnosticRoute)
             timer = Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { [weak self] _ in
                 Task { @MainActor in self?.tick() }
             }
         } catch {
             report(error)
-            if active != nil { stop(interrupted: true) }
+            if active != nil { stop(interrupted: true, reason:error as? RecorderError == .storage ? .storage : .segmentStart) }
             else { try? session.setActive(false, options: .notifyOthersOnDeactivation); refreshRoute() }
         }
     }
@@ -254,6 +256,7 @@ final class RecorderModel: NSObject, ObservableObject, AVAudioRecorderDelegate, 
         try FileManager.default.setAttributes([.protectionKey: FileProtectionType.completeUntilFirstUserAuthentication], ofItemAtPath: next.url.path)
         guard next.record(forDuration: 15) else { throw RecorderError.capture }
         recorder = next
+        transfers.diagnosticsLog.record(.segmentStart, count:r.segments.count)
     }
     private func tick() {
         guard let r = active, let recorder else { return }
@@ -271,13 +274,15 @@ final class RecorderModel: NSObject, ObservableObject, AVAudioRecorderDelegate, 
         } else { r.duration += elapsedInSegment }
         active = r
         try persist(r)
+        transfers.diagnosticsLog.record(.segmentComplete, seconds:r.duration, count:r.segments.count)
     }
-    func stop(interrupted: Bool = false, publishAudioOnly: Bool = false) {
+    func stop(interrupted: Bool = false, publishAudioOnly: Bool = false, reason: DiagnosticReason? = nil) {
         timer?.invalidate(); timer = nil
         levels.stop(); routeHistory.stop()
         guard active != nil else { return }
         var finalSegmentFailed = false
         do { try closeSegment() } catch { finalSegmentFailed = true; report(error) }
+        transfers.diagnosticsLog.record(.captureStop, interrupted:interrupted || finalSegmentFailed, reason:finalSegmentFailed ? .storage : reason ?? (interrupted ? .captureStopped : .userStop))
         var delivery: (recording: Recording, force: Bool)?
         if var r = active {
             r.state = interrupted || finalSegmentFailed ? .interrupted : .saved
@@ -310,7 +315,12 @@ final class RecorderModel: NSObject, ObservableObject, AVAudioRecorderDelegate, 
         resumeTranscriptionQueue(); resumeUploadSnapshots()
     }
     private func notification(_ note: Notification) {
+        if note.name == AVAudioSession.interruptionNotification {
+            transfers.diagnosticsLog.record((note.userInfo?[AVAudioSessionInterruptionTypeKey] as? UInt) == AVAudioSession.InterruptionType.began.rawValue ? .interruptionBegan : .interruptionEnded)
+        }
+        if note.name == AVAudioSession.mediaServicesWereResetNotification { transfers.diagnosticsLog.record(.mediaReset) }
         if note.name == AVAudioSession.routeChangeNotification {
+            transfers.diagnosticsLog.record(.routeChanged, route:diagnosticRoute)
             refreshRoute()
             if let uid = selectedInputUID,
                (note.userInfo?[AVAudioSessionRouteChangeReasonKey] as? UInt) == AVAudioSession.RouteChangeReason.oldDeviceUnavailable.rawValue,
@@ -323,30 +333,30 @@ final class RecorderModel: NSObject, ObservableObject, AVAudioRecorderDelegate, 
                 if change.changed {
                     let reason = note.userInfo?[AVAudioSessionRouteChangeReasonKey] as? UInt ?? 0
                     r.events.append("Route changed: \(actualInput) (reason \(reason))")
-                    do { try persist(r); active = r } catch { report(error); stop(interrupted: true); return }
+                    do { try persist(r); active = r } catch { report(error); stop(interrupted: true, reason:.storage); return }
                 }
                 if change.lostInput {
                     message = "Input unavailable or capture stopped after route change. Saved segments retained."
-                    stop(interrupted: true)
+                    stop(interrupted: true, reason:.lostInput)
                 }
             }
         } else if note.name == AVAudioSession.mediaServicesWereResetNotification ||
             (note.userInfo?[AVAudioSessionInterruptionTypeKey] as? UInt) == AVAudioSession.InterruptionType.began.rawValue {
             if capturePending { startupInterrupted = true }
             message = "Audio interrupted. Saved segments retained. Start a new recording when ready."
-            stop(interrupted: true); stopPlayback()
+            stop(interrupted: true, reason:note.name == AVAudioSession.mediaServicesWereResetNotification ? .mediaReset : .interruption); stopPlayback()
         }
     }
     nonisolated func audioRecorderEncodeErrorDidOccur(_ recorder: AVAudioRecorder, error: Error?) {
-        Task { @MainActor in guard self.recorder === recorder else { return }; self.message = "Audio encoding failed: \(error?.localizedDescription ?? "unknown error")"; self.stop(interrupted: true) }
+        Task { @MainActor in guard self.recorder === recorder else { return }; self.message = "Audio encoding failed: \(error?.localizedDescription ?? "unknown error")"; self.stop(interrupted: true, reason:.encode) }
     }
     nonisolated func audioRecorderDidFinishRecording(_ recorder: AVAudioRecorder, successfully flag: Bool) {
         Task { @MainActor in
             guard self.recorder === recorder, self.active != nil else { return }
             if flag {
                 do { try self.closeSegment(); try self.beginSegment() }
-                catch { self.report(error); self.stop(interrupted: true) }
-            } else { self.message = "Recording stopped unexpectedly."; self.stop(interrupted: true) }
+                catch { self.report(error); self.stop(interrupted: true, reason:error as? RecorderError == .storage ? .storage : .segmentStart) }
+            } else { self.message = "Recording stopped unexpectedly."; self.stop(interrupted: true, reason:.captureStopped) }
         }
     }
     private func persist(_ r: Recording) throws { try store?.save(r) }
@@ -371,6 +381,7 @@ final class RecorderModel: NSObject, ObservableObject, AVAudioRecorderDelegate, 
         do {
             try session.setCategory(.playback); try session.setActive(true)
             playbackRecord = r; playbackIndex = 0; playing = r.id
+            transfers.diagnosticsLog.record(.playbackStart)
             try playSegment()
         } catch { report(error); stopPlayback() }
     }
@@ -398,7 +409,7 @@ final class RecorderModel: NSObject, ObservableObject, AVAudioRecorderDelegate, 
             do { try self.playSegment() } catch { self.report(error); self.stopPlayback() }
         }
     }
-    func stopPlayback() { Task { @MainActor [weak self] in self?.runRetention() }; player?.stop(); player = nil; playing = nil; playbackRecord = nil; if active == nil { try? session.setActive(false, options: .notifyOthersOnDeactivation) } }
+    func stopPlayback() { if playing != nil { transfers.diagnosticsLog.record(.playbackStop) }; Task { @MainActor [weak self] in self?.runRetention() }; player?.stop(); player = nil; playing = nil; playbackRecord = nil; if active == nil { try? session.setActive(false, options: .notifyOthersOnDeactivation) } }
     func export(_ r: Recording, requireComplete: Bool = false) async throws -> URL {
         exportsInProgress[r.id, default: 0] += 1
         defer { exportsInProgress[r.id, default: 0] -= 1 }
@@ -458,13 +469,36 @@ final class RecorderModel: NSObject, ObservableObject, AVAudioRecorderDelegate, 
             transcriptionTask?.cancel()
         }
     }
-    func background() { recorder?.isMeteringEnabled = false; levels.pause(); snapshotTask?.cancel(); suspended = true; deferTranscription(); cancelCleanup() }
+    func background() { transfers.diagnosticsLog.record(.background); recorder?.isMeteringEnabled = false; levels.pause(); snapshotTask?.cancel(); suspended = true; deferTranscription(); cancelCleanup() }
     func foreground() {
+        transfers.diagnosticsLog.record(.foreground)
         suspended = false; recorder?.isMeteringEnabled = true; levels.pause()
+        // Timers do not fire while suspended. Read the real recorder clock immediately.
+        tick()
         refreshRoute(); runRetention(); resumeTranscriptionQueue(); resumeUploadSnapshots()
         #if DEBUG && targetEnvironment(simulator)
         if syntheticFeedback { showSyntheticCaptureFeedback() }
         #endif
+    }
+    var diagnosticRoute: DiagnosticRoute {
+        guard let type = session.currentRoute.inputs.first?.portType else { return .none }
+        switch type {
+        case .builtInMic: return .builtIn
+        case .bluetoothHFP, .bluetoothLE, .bluetoothA2DP: return .bluetooth
+        case .headsetMic, .lineIn: return .wired
+        case .usbAudio: return .usb
+        default: return .other
+        }
+    }
+    var diagnosticSnapshot: RecorderDiagnosticSnapshot {
+        RecorderDiagnosticSnapshot(recorderExists:recorder != nil,recorderCapturing:recorder?.isRecording == true,
+            displayRecording:active != nil,displayElapsed:elapsed,recorderElapsed:recorder?.currentTime ?? 0,
+            completedSeconds:active?.duration ?? 0,segmentCount:active?.segments.count ?? 0,
+            foreground:!suspended,metersRunning:levels.running)
+    }
+    func sendDiagnostics() {
+        do { try transfers.enqueueDiagnostics(snapshot:diagnosticSnapshot); diagnosticsNotice = nil }
+        catch { diagnosticsNotice = error.localizedDescription }
     }
     private func transcribe(_ r: Recording, download: Bool) async {
         transcribing = true
