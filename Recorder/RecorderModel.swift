@@ -7,18 +7,21 @@ final class RecorderModel: NSObject, ObservableObject, AVAudioRecorderDelegate, 
     @Published var recordings: [Recording] = []
     @Published var active: Recording?
     @Published var vocabulary: [VocabularyCorrection] = []
-    @Published var selectedInputName: String = UserDefaults.standard.string(forKey: "preferredInputName") ?? "System default"
+    @Published var selectedInputName = "System default"
     @Published var preferredInputAvailable: Bool?
     var microphonePreferenceLabel: String { Self.preferenceLabel(name: selectedInputName, available: preferredInputAvailable) }
     static func preferenceLabel(name: String, available: Bool?) -> String {
         if name == "System default" { return name }
         switch available {
         case true: return name + " · preference"
-        case false: return name + " unavailable · System default"
+        case false: return name + " unavailable · recording blocked"
         case nil: return name + " · preference (availability unchecked)"
         }
     }
-    private var selectedInputUID: String? = UserDefaults.standard.string(forKey: "preferredInputUID")
+    @Published private(set) var selectingInput = false
+    @Published var inputSelectionNotice: String?
+    private var selectedInputUID: String?
+    private let captureRouting: CaptureRouting?
     private var vocabularyStore: VocabularyStore?
     private var vocabularyReadable = true
     @Published private(set) var retention: RecordingRetention
@@ -75,11 +78,13 @@ final class RecorderModel: NSObject, ObservableObject, AVAudioRecorderDelegate, 
 
     init(root requestedRoot: URL? = nil,
          speech: @escaping ([URL], Bool) async throws -> LocalTranscript = { try await LocalSpeech.transcribe($0, download: $1) },
+         captureRouting: CaptureRouting? = nil,
          audioExport: ((Recording) async throws -> URL)? = nil,
          cleanup: ((String, [VocabularyCorrection]) async throws -> String)? = nil,
          retentionDefaults: UserDefaults? = nil,
          protectedDataAvailable: @escaping () -> Bool = { UIApplication.shared.isProtectedDataAvailable }) {
         let defaults = retentionDefaults ?? requestedRoot.flatMap { UserDefaults(suiteName: "RecorderTests." + $0.lastPathComponent) } ?? .standard
+        self.captureRouting = captureRouting
         self.retentionDefaults = defaults
         self.retention = RecordingRetention.load(from: defaults)
         self.protectedDataAvailable = protectedDataAvailable
@@ -97,6 +102,8 @@ final class RecorderModel: NSObject, ObservableObject, AVAudioRecorderDelegate, 
         transfers = NStackTransfers(root: requestedRoot.map { $0.deletingLastPathComponent().appendingPathComponent($0.lastPathComponent + "-transfers") } ?? (candidate?.root.deletingLastPathComponent() ?? FileManager.default.temporaryDirectory).appendingPathComponent("NStack"))
         store = candidate
         super.init()
+        selectedInputUID = defaults.string(forKey: "preferredInputUID")
+        selectedInputName = defaults.string(forKey: "preferredInputName") ?? "System default"
         recordings = loaded; message = failure
         if let candidate {
             vocabularyStore = VocabularyStore(url: candidate.root.appendingPathComponent("vocabulary.json"))
@@ -145,22 +152,22 @@ final class RecorderModel: NSObject, ObservableObject, AVAudioRecorderDelegate, 
         }
     }
     func refreshRoute() {
-        let availableInputs = session.availableInputs
-        inputs = availableInputs ?? []
+        inputs = session.availableInputs ?? []
+        let available = captureRouting?.available() ?? session.availableInputs?.map { CaptureInput(uid: $0.uid, source: nil, name: $0.portName) }
         if let uid = selectedInputUID {
-            if let availableInputs { preferredInputAvailable = availableInputs.contains { $0.uid == uid } }
-            else if active != nil { preferredInputAvailable = session.currentRoute.inputs.contains { $0.uid == uid } }
+            if CaptureInputPolicy.matches(uid: uid, inputs: routeSnapshot) { preferredInputAvailable = true }
+            else if let available { preferredInputAvailable = available.contains { $0.uid == uid } }
             // Deactivation may hide availableInputs; retain the last known availability.
         } else { preferredInputAvailable = nil }
-        actualInput = session.currentRoute.inputs.map { port in
-            port.portName + (port.selectedDataSource.map { " · " + $0.dataSourceName } ?? "")
-        }.joined(separator: ", ")
+        actualInput = routeSnapshot.map(\.name).joined(separator: ", ")
         if actualInput.isEmpty { actualInput = "No active input" }
     }
     private var routeSnapshot: [CaptureInput] {
-        session.currentRoute.inputs.map { CaptureInput(uid: $0.uid, source: $0.selectedDataSource?.dataSourceID.stringValue, name: $0.portName) }
+        captureRouting?.current() ?? session.currentRoute.inputs.map { CaptureInput(uid: $0.uid, source: $0.selectedDataSource?.dataSourceID.stringValue, name: $0.portName + ($0.selectedDataSource.map { " · " + $0.dataSourceName } ?? "")) }
     }
     func prepareInputs() async {
+        guard !selectingInput, !capturePending else { return }
+        guard active == nil, playing == nil else { refreshRoute(); return }
         guard await AVAudioApplication.requestRecordPermission() else {
             message = "Microphone access denied. Enable it in Settings → Privacy & Security → Microphone → Pete Recorder."
             return
@@ -172,27 +179,53 @@ final class RecorderModel: NSObject, ObservableObject, AVAudioRecorderDelegate, 
             refreshRoute()
         } catch { report(error) }
     }
-    func selectInput(_ input: AVAudioSessionPortDescription) {
-        do {
-            try session.setPreferredInput(input)
-            selectedInputUID = input.uid; selectedInputName = input.portName
-            UserDefaults.standard.set(input.uid, forKey: "preferredInputUID")
-            UserDefaults.standard.set(input.portName, forKey: "preferredInputName")
-            refreshRoute()
-            if var r = active { r.events.append("Input preference: \(input.portName); actual: \(actualInput)"); try persist(r); active = r }
-        } catch { report(error); if active != nil { stop(interrupted: true, reason:.inputSelection) } }
+    func selectInput(_ input: AVAudioSessionPortDescription) async {
+        await chooseInput(uid: input.uid, name: input.portName)
     }
-    func selectSystemInput() {
+    func selectSystemInput() async {
+        await chooseInput(uid: nil, name: "System default")
+    }
+    func chooseInput(uid: String?, name: String) async {
+        guard !selectingInput, !capturePending, !busy, playing == nil else { return }
+        startupInterrupted = false
+        selectingInput = true
+        inputSelectionNotice = "Requesting \(name)… Checking actual input."
+        defer { selectingInput = false }
         do {
-            try session.setPreferredInput(nil)
-            selectedInputUID = nil; selectedInputName = "System default"
-            UserDefaults.standard.removeObject(forKey: "preferredInputUID")
-            UserDefaults.standard.removeObject(forKey: "preferredInputName")
+            if captureRouting == nil && active == nil {
+                try session.setCategory(.playAndRecord, mode: .default, options: [.defaultToSpeaker, .allowBluetoothHFP])
+                try session.setActive(true)
+            }
+            try await requestVerifiedCaptureInput(uid: uid, name: name,
+                request: { try self.requestInput(uid: uid, name: name) }, current: { self.routeSnapshot },
+                interrupted: { self.startupInterrupted }, ready: { self.active == nil || self.captureIsRecording })
             refreshRoute()
-        } catch { report(error) }
+            guard !startupInterrupted, CaptureInputPolicy.matches(uid: uid, inputs: routeSnapshot) else {
+                throw MicrophoneSelectionError.unhonoured(name, actualInput)
+            }
+            selectedInputUID = uid; selectedInputName = name
+            retentionDefaults.set(uid, forKey: "preferredInputUID")
+            retentionDefaults.set(uid == nil ? nil : name, forKey: "preferredInputName")
+            refreshRoute()
+            inputSelectionNotice = uid == nil ? "System default selected. iOS may change the microphone." : "Selected \(name). Actual input: \(actualInput)."
+            if var r = active {
+                r.events.append("Input selected: \(name); actual: \(actualInput)")
+                try persist(r); active = r
+            }
+            if active != nil && !captureIsRecording {
+                message = "Capture stopped during microphone selection. Saved audio retained. Start a new recording."
+                stop(interrupted: true, reason: .inputSelection)
+            }
+        } catch {
+            refreshRoute()
+            inputSelectionNotice = "\(error.localizedDescription) Reconnect the chosen device and try again, or explicitly choose System default."
+            message = inputSelectionNotice
+            // A failed request may still have changed the route. Preserve audio and require restart.
+            if active != nil { stop(interrupted: true, reason: .inputSelection) }
+        }
     }
     func start(route requestedRoute: DialogueRouteSnapshot? = nil) async {
-        guard !capturePending, active == nil, (!busy || snapshotTask != nil), let store else { return }
+        guard !selectingInput, !capturePending, active == nil, (!busy || snapshotTask != nil), let store else { return }
         // Capture routing before any permission prompt, audio-session wait or mutable settings read.
         let immutableRoute = requestedRoute ?? transfers.captureRoute()
         capturePending = true; startupInterrupted = false; defer { capturePending = false }
@@ -206,18 +239,19 @@ final class RecorderModel: NSObject, ObservableObject, AVAudioRecorderDelegate, 
         do {
             try session.setCategory(.playAndRecord, mode: .default, options: [.defaultToSpeaker, .allowBluetoothHFP])
             try session.setActive(true)
-            let requestedInput = selectedInputUID.flatMap { uid in session.availableInputs?.first { $0.uid == uid } }
-            try session.setPreferredInput(requestedInput) // A vanished preference must not masquerade as an actual route.
             // Route selection can complete asynchronously. Yield without opening another capture.
-            try await waitForPreferredCaptureInput(uid: requestedInput?.uid, current: { self.routeSnapshot },
-                                                   interrupted: { self.startupInterrupted })
+            try await requestVerifiedCaptureInput(uid: selectedInputUID, name: selectedInputName,
+                request: { try self.requestInput(uid: self.selectedInputUID, name: self.selectedInputName) }, current: { self.routeSnapshot },
+                interrupted: { self.startupInterrupted })
             guard !startupInterrupted else { throw RecorderError.capture }
             try Task.checkCancellation()
             refreshRoute()
+            guard CaptureInputPolicy.matches(uid: selectedInputUID, inputs: routeSnapshot) else {
+                throw MicrophoneSelectionError.unhonoured(selectedInputName, actualInput)
+            }
             var r = Recording(title: Date.now.formatted(date: .abbreviated, time: .shortened))
             r.dialogueRoute = immutableRoute
             r.events.append("Started with \(actualInput)")
-            if preferredInputAvailable == false { r.events.append("Preferred microphone unavailable: \(selectedInputName). Actual route: \(actualInput)") }
             try store.save(r) // Intent is durable before the microphone starts.
             active = r; elapsed = 0
             levels.start()
@@ -226,17 +260,19 @@ final class RecorderModel: NSObject, ObservableObject, AVAudioRecorderDelegate, 
             routeHistory.start(routeSnapshot)
             if var started = active {
                 started.events[0] = "Started with \(actualInput)"
-                if let requestedInput, !session.currentRoute.inputs.contains(where: { $0.uid == requestedInput.uid }) {
-                    started.events.append("Preferred microphone request not yet reflected in actual route: \(selectedInputName); actual: \(actualInput)")
-                }
                 try persist(started); active = started
             }
+            guard enforceCaptureInput() else { return }
             transfers.diagnosticsLog.record(.captureStart, route:diagnosticRoute)
             timer = Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { [weak self] _ in
                 Task { @MainActor in self?.tick() }
             }
         } catch {
             report(error)
+            if error is MicrophoneSelectionError {
+                message = "\(error.localizedDescription) Reconnect and select the chosen microphone, or explicitly choose System default, then start again."
+                inputSelectionNotice = message
+            }
             if active != nil { stop(interrupted: true, reason:error as? RecorderError == .storage ? .storage : .segmentStart) }
             else { try? session.setActive(false, options: .notifyOthersOnDeactivation); refreshRoute() }
         }
@@ -258,7 +294,43 @@ final class RecorderModel: NSObject, ObservableObject, AVAudioRecorderDelegate, 
         recorder = next
         transfers.diagnosticsLog.record(.segmentStart, count:r.segments.count)
     }
+    private var captureIsRecording: Bool { captureRouting?.isCapturing?() ?? (recorder?.isRecording == true) }
+    private func requestInput(uid: String?, name: String) throws {
+        // Actual route outranks temporarily stale discovery. Apple requires request ports
+        // to come from availableInputs, so do not submit a stale port when already routed.
+        if let captureRouting {
+            guard uid == nil || captureRouting.available()?.contains(where: { $0.uid == uid }) == true else {
+                if let uid, CaptureInputPolicy.matches(uid: uid, inputs: routeSnapshot) { return }
+                throw MicrophoneSelectionError.unavailable(name)
+            }
+            try captureRouting.request(uid)
+        } else {
+            let port = uid.flatMap { id in session.availableInputs?.first { $0.uid == id } }
+            guard uid == nil || port != nil else {
+                if let uid, CaptureInputPolicy.matches(uid: uid, inputs: routeSnapshot) { return }
+                throw MicrophoneSelectionError.unavailable(name)
+            }
+            try session.setPreferredInput(port)
+        }
+    }
+    @discardableResult
+    func enforceCaptureInput() -> Bool {
+        guard active != nil, !selectingInput else { return true }
+        guard CaptureInputPolicy.matches(uid: selectedInputUID, inputs: routeSnapshot) else {
+            refreshRoute()
+            let warning = "iOS changed the microphone from \(selectedInputName) to \(actualInput). Recording stopped; saved audio retained. Reconnect and select the chosen microphone, or explicitly choose System default, then start again."
+            if var r = active {
+                r.events.append(warning)
+                do { try persist(r); active = r } catch { report(error) }
+            }
+            stop(interrupted: true, reason: .inputSelection)
+            message = warning; inputSelectionNotice = warning
+            return false
+        }
+        return true
+    }
     private func tick() {
+        guard enforceCaptureInput() else { return }
         guard let r = active, let recorder else { return }
         elapsed = r.duration + recorder.currentTime
         guard !suspended, recorder.isRecording else { return }
@@ -322,12 +394,6 @@ final class RecorderModel: NSObject, ObservableObject, AVAudioRecorderDelegate, 
         if note.name == AVAudioSession.routeChangeNotification {
             transfers.diagnosticsLog.record(.routeChanged, route:diagnosticRoute)
             refreshRoute()
-            if let uid = selectedInputUID,
-               (note.userInfo?[AVAudioSessionRouteChangeReasonKey] as? UInt) == AVAudioSession.RouteChangeReason.oldDeviceUnavailable.rawValue,
-               let previous = note.userInfo?[AVAudioSessionRouteChangePreviousRouteKey] as? AVAudioSessionRouteDescription,
-               previous.inputs.contains(where: { $0.uid == uid }), !session.currentRoute.inputs.contains(where: { $0.uid == uid }) {
-                preferredInputAvailable = false
-            }
             if var r = active {
                 let change = routeHistory.observe(routeSnapshot, capturing: recorder?.isRecording == true)
                 if change.changed {
@@ -335,14 +401,15 @@ final class RecorderModel: NSObject, ObservableObject, AVAudioRecorderDelegate, 
                     r.events.append("Route changed: \(actualInput) (reason \(reason))")
                     do { try persist(r); active = r } catch { report(error); stop(interrupted: true, reason:.storage); return }
                 }
-                if change.lostInput {
+                guard enforceCaptureInput() else { return }
+                if change.lostInput && !selectingInput {
                     message = "Input unavailable or capture stopped after route change. Saved segments retained."
                     stop(interrupted: true, reason:.lostInput)
                 }
             }
         } else if note.name == AVAudioSession.mediaServicesWereResetNotification ||
             (note.userInfo?[AVAudioSessionInterruptionTypeKey] as? UInt) == AVAudioSession.InterruptionType.began.rawValue {
-            if capturePending { startupInterrupted = true }
+            if capturePending || selectingInput { startupInterrupted = true }
             message = "Audio interrupted. Saved segments retained. Start a new recording when ready."
             stop(interrupted: true, reason:note.name == AVAudioSession.mediaServicesWereResetNotification ? .mediaReset : .interruption); stopPlayback()
         }

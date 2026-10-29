@@ -109,7 +109,7 @@ struct RecorderView: View {
                         Image(systemName:"mic.fill")
                         VStack(alignment:.leading,spacing:1) {
                             Text(model.actualInput).font(.caption.weight(.semibold)).lineLimit(1)
-                            Text(model.preferredInputAvailable == false ? "Saved microphone unavailable · System default" : "Tap to choose microphone")
+                            Text(model.selectingInput ? "Checking microphone…" : model.microphonePreferenceLabel)
                                 .font(.caption2).lineLimit(1)
                         }
                     }
@@ -120,7 +120,7 @@ struct RecorderView: View {
                 .buttonStyle(.bordered)
                 .controlSize(.small)
                 .accessibilityIdentifier("microphoneControl")
-                .disabled(model.busy)
+                .disabled(model.busy || model.selectingInput)
                 if model.active != nil {
                     CaptureLevelView(levels: model.levels)
                     Text(Duration.seconds(model.elapsed).formatted(.time(pattern: .hourMinuteSecond)))
@@ -329,12 +329,14 @@ struct RecorderView: View {
             List {
                 Section("Preference") {
                     Text(model.microphonePreferenceLabel)
-                    Text("The preference is used when available. iOS chooses the actual route.").font(.footnote)
-                    Button("System default") { model.selectSystemInput() }
+                    Text("A specific microphone is required to record. If iOS substitutes another input, recording stops and audio is retained. System default explicitly allows iOS to change inputs.").font(.footnote)
+                    Button("System default") { Task { await model.selectSystemInput() } }
+                        .disabled(model.selectingInput || model.busy)
                 }
+                if let notice = model.inputSelectionNotice { Section("Selection status") { Text(notice).accessibilityIdentifier("microphoneSelectionStatus") } }
                 Section("Actual current route") { Text(model.actualInput) }
                 Section("Supported inputs") {
-                    ForEach(model.inputs, id: \.uid) { input in Button(input.portName) { model.selectInput(input) } }
+                    ForEach(model.inputs, id: \.uid) { input in Button(input.portName) { Task { await model.selectInput(input) } }.disabled(model.selectingInput || model.busy) }
                     if model.inputs.isEmpty { Text("No selectable inputs available.") }
                 }
                 if let notice = model.message { Section("Notice") { Text(notice) } }

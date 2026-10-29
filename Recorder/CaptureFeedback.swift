@@ -71,10 +71,49 @@ struct CaptureLevelView: View {
 // Injectable waits let regressions exercise delayed selection without audio hardware.
 @MainActor
 func waitForPreferredCaptureInput(uid: String?, current: () -> [CaptureInput], interrupted: () -> Bool,
+                                  ready: () -> Bool = { true },
                                   wait: () async throws -> Void = { try await Task.sleep(for: .milliseconds(50)) }) async throws {
-    guard let uid else { return }
     for _ in 0..<20 {
-        if current().contains(where: { $0.uid == uid }) || interrupted() { return }
+        if (CaptureInputPolicy.matches(uid: uid, inputs: current()) && ready()) || interrupted() { return }
         try await wait()
     }
+}
+
+// UID is the OS port identity, never the display name or the requested preference.
+enum CaptureInputPolicy {
+    static func matches(uid: String?, inputs: [CaptureInput]) -> Bool {
+        guard let uid else { return true } // Explicit system routing accepts substitutions.
+        return !inputs.isEmpty && inputs.allSatisfy { $0.uid == uid }
+    }
+}
+
+enum MicrophoneSelectionError: LocalizedError {
+    case unavailable(String)
+    case unhonoured(String, String)
+    var errorDescription: String? {
+        switch self {
+        case .unavailable(let name): return "Chosen microphone \(name) is unavailable. Recording requires this microphone."
+        case .unhonoured(let name, let actual): return "iOS could not select \(name). Actual input: \(actual). Recording requires the chosen microphone."
+        }
+    }
+}
+
+// One request, one bounded verification; no automatic retry loop against iOS routing.
+@MainActor
+func requestVerifiedCaptureInput(uid: String?, name: String, request: () throws -> Void,
+                                 current: () -> [CaptureInput], interrupted: () -> Bool, ready: () -> Bool = { true },
+                                 wait: () async throws -> Void = { try await Task.sleep(for: .milliseconds(50)) }) async throws {
+    try request()
+    try await waitForPreferredCaptureInput(uid: uid, current: current, interrupted: interrupted, ready: ready, wait: wait)
+    guard !interrupted(), ready(), CaptureInputPolicy.matches(uid: uid, inputs: current()) else {
+        let actual = current().map(\.name).joined(separator: ", ")
+        throw MicrophoneSelectionError.unhonoured(name, actual.isEmpty ? "No active input" : actual)
+    }
+}
+
+struct CaptureRouting {
+    let current: () -> [CaptureInput]
+    let available: () -> [CaptureInput]?
+    let request: (String?) throws -> Void
+    var isCapturing: (() -> Bool)? = nil
 }

@@ -161,7 +161,7 @@ final class TranscriptionQueueTests: XCTestCase {
         XCTFail("Queue did not reach expected state")
     }
     func testMicrophonePreferenceAvailabilityIsExplicit() {
-        XCTAssertEqual(RecorderModel.preferenceLabel(name: "USB mic", available: false), "USB mic unavailable · System default")
+        XCTAssertEqual(RecorderModel.preferenceLabel(name: "USB mic", available: false), "USB mic unavailable · recording blocked")
         XCTAssertEqual(RecorderModel.preferenceLabel(name: "USB mic", available: nil), "USB mic · preference (availability unchecked)")
         XCTAssertEqual(RecorderModel.preferenceLabel(name: "USB mic", available: true), "USB mic · preference")
         XCTAssertEqual(RecorderModel.preferenceLabel(name: "System default", available: nil), "System default")

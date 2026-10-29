@@ -132,6 +132,12 @@ extension RecorderSmokeTests {
         XCTAssertTrue(app.otherElements["captureLevelHistory"].waitForExistence(timeout: 10))
         XCTAssertTrue(app.buttons["microphoneControl"].label.contains("Synthetic microphone"))
         XCTAssertFalse(app.alerts["Recorder notice"].exists)
+        app.buttons["microphoneControl"].tap()
+        XCTAssertTrue(app.navigationBars["Microphone"].waitForExistence(timeout: 5))
+        XCTAssertTrue(app.staticTexts["Actual current route"].exists)
+        XCTAssertTrue(app.buttons["System default"].exists)
+        XCTAssertTrue(app.staticTexts.matching(NSPredicate(format: "label CONTAINS %@", "If iOS substitutes another input")).firstMatch.exists)
+        app.buttons["Done"].tap()
         let image = XCTAttachment(screenshot: app.screenshot()); image.name = "Synthetic live recording levels"; image.lifetime = .keepAlways; add(image)
     }
 }
