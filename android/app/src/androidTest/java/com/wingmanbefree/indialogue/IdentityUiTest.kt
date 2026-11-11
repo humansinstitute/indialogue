@@ -22,7 +22,7 @@ class IdentityUiTest {
         assertTrue(android.os.Build.MODEL.contains("sdk"))
         assertFalse("Isolated emulator must have no user identity", app.identity.exists)
         fun click(text: String) {
-            val item = device.wait(Until.findObject(By.text(text)), 8000)
+            val item = device.wait(Until.findObject(if (text == "Menu") By.desc("Menu") else By.text(text)), 8000)
             assertNotNull(text, item)
             item.click()
             device.waitForIdle()

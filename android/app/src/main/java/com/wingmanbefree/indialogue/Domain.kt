@@ -71,6 +71,8 @@ data class Recording(
     var speech: String = "none",
     var notice: String? = null,
     var autoDestination: Destination? = null,
+    val dialogueRoute: DialogueRoute? = null,
+    var audioOnly: Boolean = false,
 ) {
     val review: String
         get() = edited ?: raw.orEmpty()
@@ -241,3 +243,26 @@ data class Retention(val enabled: Boolean = false, val days: Int = 30) {
 }
 
 @Serializable data class InputPreference(val type: Int, val name: String, val address: String)
+
+/** Selected inputs must be verified after the bounded startup grace. Never silently substitute. */
+fun inputRouteAllowed(selected: Boolean, preferredId: Int?, actualId: Int?, elapsedMs: Long): Boolean =
+    !selected || (preferredId != null && actualId == preferredId) || (preferredId != null && elapsedMs < 1000)
+
+fun automaticDelivery(route: DialogueRoute?, audioOnly: Boolean): Destination? =
+    route?.destination?.takeIf { audioOnly || it.automatic }
+
+fun responseTransfer(jobs: List<Transfer>, replyId: String): Transfer? =
+    jobs.lastOrNull { it.route?.respondingToReplyId == replyId && it.state != "cancelled" }
+
+fun pendingResponse(recordings: List<Recording>, jobs: List<Transfer>, replyId: String): Recording? =
+    recordings.lastOrNull { r -> r.dialogueRoute?.respondingToReplyId == replyId && jobs.none { it.recordingId == r.id } }
+
+fun canSendConversation(job: Transfer) = job.state == "queued" || job.state == "failed" || job.state.startsWith("paused_")
+
+fun conversationKey(job: Transfer) = job.route?.conversationId ?: job.id
+
+fun acceptedConversation(jobs: List<Transfer>, job: Transfer): Transfer? =
+    jobs.lastOrNull { conversationKey(it) == conversationKey(job) && it.state == "sent" && it.threadId != null }
+
+fun replyPollingTarget(jobs: List<Transfer>, displayedKeys: Set<String> = jobs.map(::conversationKey).toSet()): Transfer? =
+    jobs.lastOrNull { it.route != null && it.state == "sent" && it.threadId != null && conversationKey(it) in displayedKeys }

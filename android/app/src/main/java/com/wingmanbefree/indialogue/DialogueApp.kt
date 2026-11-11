@@ -14,6 +14,8 @@ import kotlinx.serialization.decodeFromString
 import kotlinx.serialization.encodeToString
 
 class DialogueApp : Application() {
+    val diagnostics by lazy { Diagnostics(File(root, "diagnostics/events.json")) }
+    val replies by lazy { ReplyController(this) }
     val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
     lateinit var root: File
         private set
@@ -169,12 +171,23 @@ class DialogueApp : Application() {
             block()
             revision.value++
         } catch (e: Exception) {
+            diagnostics.record(DiagnosticEvent.OperationFailed)
             notice.value = e.message ?: "Operation failed; files retained."
         }
     }
 
-    fun startCapture() {
+    var pendingRoute: DialogueRoute? = null
+        private set
+
+    fun startCapture(route: DialogueRoute? = null) {
         if (stoppingJobs || active.value != null || capturePending.value) return
+        try {
+            val mode = transfers.ledger.routing.mode
+            val destination = transfers.ledger.routing.destination(transfers.destination)
+            check(route != null || mode == DialogueMode.Normal || destination != null) { "Configure the $mode route in NStack first." }
+            pendingRoute = route ?: destination?.let { DialogueRoute(it, mode) }
+        } catch (e: Exception) { notice.value = e.message.orEmpty(); return }
+        diagnostics.record(DiagnosticEvent.CaptureRequested)
         capturePending.value = true
         val previous = listOfNotNull(worker, cleanupJob, modelJob, transferJob, snapshotJob)
         prioritizeCapture()
@@ -198,8 +211,8 @@ class DialogueApp : Application() {
         }
     }
 
-    fun stopCapture() {
-        startService(Intent(this, CaptureService::class.java).setAction("stop"))
+    fun stopCapture(audioOnly: Boolean = false) {
+        startService(Intent(this, CaptureService::class.java).setAction("stop").putExtra("audioOnly", audioOnly))
     }
 
     fun prioritizeCapture() {
@@ -210,6 +223,7 @@ class DialogueApp : Application() {
         transferJob?.cancel()
         snapshotJob?.cancel()
         stopPlayback()
+        replies.stop()
         levels.value = emptyList()
         scope.launch {
             worker?.join()
@@ -222,6 +236,7 @@ class DialogueApp : Application() {
     }
 
     fun onForeground() {
+        diagnostics.record(DiagnosticEvent.Foreground)
         speechStorageBlocked = false
         foreground.value = true
         levels.value = emptyList()
@@ -230,7 +245,9 @@ class DialogueApp : Application() {
     }
 
     fun onBackground() {
+        diagnostics.record(DiagnosticEvent.Background)
         foreground.value = false
+        replies.stop()
         levels.value = emptyList()
         worker?.cancel()
         cleanupJob?.cancel()
@@ -295,7 +312,7 @@ class DialogueApp : Application() {
         if (worker != null || cleanupJob != null || modelJob != null) return
         val automatic =
             recordings.value.firstOrNull {
-                it.autoDestination != null && it.speech == "complete" && it.state == "saved"
+                it.autoDestination != null && (it.audioOnly || it.speech == "complete") && it.state == "saved"
             }
         if (automatic != null) {
             makeSnapshot(automatic, automatic.autoDestination!!, true)
@@ -343,8 +360,11 @@ class DialogueApp : Application() {
                                 "Delivery deferred until foreground, idle capture and matching identity unlock."
                             }
                         }
+                        diagnostics.record(DiagnosticEvent.DeliveryStarted)
                         transferEngine(job, NStackAPI(identity, gate), gate)
+                        diagnostics.record(DiagnosticEvent.DeliverySent)
                     } catch (e: Exception) {
+                        diagnostics.record(DiagnosticEvent.DeliveryFailed)
                         if (job.state != "cancelled") {
                             job.state =
                                 if (e is CancellationException)
@@ -606,6 +626,7 @@ class DialogueApp : Application() {
     }
 
     fun play(id: String) {
+        replies.stop()
         if (active.value != null || capturePending.value || stoppingJobs) {
             notice.value = "Playback waits until capture is stopped."
             return
@@ -657,7 +678,7 @@ class DialogueApp : Application() {
         revision.value++
     }
 
-    fun upload(id: String) {
+    fun upload(id: String, audioOnly: Boolean = false) {
         action {
             val r = library.get(id)
             val existing =
@@ -668,7 +689,11 @@ class DialogueApp : Application() {
                 else retryUpload(existing)
                 return@action
             }
-            val d = r.autoDestination ?: transfers.destination ?: error("Configure NStack first.")
+            if (audioOnly) {
+                update(id) { it.audioOnly = true }
+                r.audioOnly = true
+            }
+            val d = r.dialogueRoute?.destination ?: r.autoDestination ?: transfers.destination ?: error("Configure NStack first.")
             makeSnapshot(r, d, r.autoDestination != null)
             resume()
             refresh()
@@ -731,7 +756,20 @@ class DialogueApp : Application() {
         }
     }
 
+    fun sendDiagnostics() {
+        action {
+            check(foreground.value && active.value == null && !capturePending.value) { "Finish capture before sending diagnostics." }
+            val d = transfers.ledger.routing.destination(transfers.destination) ?: error("Configure NStack first.")
+            check(identity.unlocked && identity.npub() == d.signer) { "Unlock the matching route identity first." }
+            transfers.snapshotDiagnostics(d, diagnostics.report(BuildConfig.VERSION_NAME))
+            refresh(); resume()
+            notice.value = "Private diagnostics queued. Retry and status are available in NStack uploads."
+        }
+    }
+
     fun lock() {
+        diagnostics.record(DiagnosticEvent.IdentityLocked)
+        replies.stop()
         transferJob?.cancel()
         snapshotJob?.cancel()
         identity.lock()

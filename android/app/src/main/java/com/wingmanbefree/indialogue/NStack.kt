@@ -48,6 +48,31 @@ data class Destination(
 }
 
 @Serializable
+enum class DialogueMode { Normal, Channel, Agent }
+
+@Serializable
+data class DialogueRoute(
+    val destination: Destination,
+    val mode: DialogueMode = DialogueMode.Normal,
+    val conversationId: String = uuid(),
+    val threadId: String? = null,
+    val respondingToReplyId: String? = null,
+)
+
+@Serializable
+data class Routing(
+    val mode: DialogueMode = DialogueMode.Normal,
+    val channel: Destination? = null,
+    val agent: Destination? = null,
+) {
+    fun destination(normal: Destination?) = when (mode) {
+        DialogueMode.Normal -> normal
+        DialogueMode.Channel -> channel
+        DialogueMode.Agent -> agent
+    }
+}
+
+@Serializable
 data class TransferFile(
     val name: String,
     val mime: String,
@@ -70,12 +95,16 @@ data class Transfer(
     var state: String = "queued",
     var notice: String? = null,
     var messageId: String? = null,
+    var threadId: String? = null,
+    val route: DialogueRoute? = null,
+    val diagnostics: Boolean = false,
 )
 
 @Serializable
 data class Ledger(
     val destination: Destination? = null,
     val jobs: MutableList<Transfer> = mutableListOf(),
+    val routing: Routing = Routing(),
 )
 
 data class Choice(val id: String, val label: String, val app: String = "")
@@ -187,6 +216,38 @@ class NStackAPI(
         return codec.parseToJsonElement(execute(b.build()).toString(Charsets.UTF_8)).jsonObject
     }
 
+    suspend fun downloadAudio(d: Destination, objectId: String, target: File) = withContext(Dispatchers.IO) {
+        UUID.fromString(objectId)
+        val url = origin(d.origin) + "/api/v4/storage/$objectId/content"
+        gate()
+        val event = identity.sign(27235, authTags(url, "GET", null), "")
+        val request = Request.Builder().url(url)
+            .header("Authorization", "Nostr " + Base64.getEncoder().encodeToString(event.toString().toByteArray()))
+            .header("x-flightdeck-pg-app-npub", d.appNpub).build()
+        val call = client.newCall(request)
+        val watcher = launch { try { awaitCancellation() } finally { call.cancel() } }
+        try {
+            call.execute().use { response ->
+                check(response.code in 200..299) { "Reply audio HTTP ${response.code}; retry Listen." }
+                val body = checkNotNull(response.body)
+                check(body.contentLength() <= 32 * 1024 * 1024) { "Reply audio exceeds 32 MiB playback limit." }
+                body.byteStream().use { input -> target.outputStream().use { output ->
+                    val buffer = ByteArray(65536)
+                    var total = 0L
+                    while (true) {
+                        ensureActive(); gate()
+                        val count = input.read(buffer)
+                        if (count < 0) break
+                        total += count
+                        check(total <= 32 * 1024 * 1024) { "Reply audio exceeds 32 MiB playback limit." }
+                        output.write(buffer, 0, count)
+                    }
+                } }
+            }
+            gate()
+        } finally { watcher.cancel() }
+    }
+
     suspend fun put(file: File, url: String, d: Destination, f: TransferFile) {
         val uri = URI(url)
         val pinned = URI(origin(d.origin))
@@ -231,7 +292,7 @@ class NStackAPI(
                 request(
                     origin,
                     path +
-                        "?limit=200" +
+                        (if (path.contains("?")) "&limit=200" else "?limit=200") +
                         (cursor?.let { "&cursor=" + URLEncoder.encode(it, "UTF-8") } ?: ""),
                     app,
                 )
@@ -406,13 +467,16 @@ class NStackAPI(
                     listOf("body_sha256", hash),
                     listOf("workspace_id", d.workspace),
                     listOf("channel_id", d.channel),
-                ),
+                ) + (job.route?.threadId?.let { listOf(listOf("thread_id", it)) } ?: emptyList()),
                 body,
             )
         return buildJsonObject {
             put("body", body)
-            put("create_thread", true)
-            put("thread_title", job.title.take(120))
+            if (job.route?.threadId != null) put("thread_id", job.route.threadId)
+            else {
+                put("create_thread", true)
+                put("thread_title", job.title.take(120))
+            }
             put("client_request_id", job.id)
             put(
                 "message_signature",
@@ -443,7 +507,7 @@ class NStackAPI(
                         ),
                     )
                     put(
-                        "recorder",
+                        if (job.diagnostics) "diagnostics" else "recorder",
                         buildJsonObject {
                             put("recording_id", job.recordingId)
                             put("snapshot_id", job.id)
@@ -452,7 +516,7 @@ class NStackAPI(
                     )
                 },
             )
-            if (d.recipient != null)
+            if (!job.diagnostics && d.recipient != null)
                 put(
                     "mentions",
                     buildJsonArray {
@@ -488,12 +552,15 @@ class Transfers(val root: File) {
             val file = File(root, "ledger.json")
             if (file.exists()) ledger = codec.decodeFromString(file.readText())
             ledger.destination?.validate()
+            ledger.routing.channel?.validate()
+            ledger.routing.agent?.validate()
             jobs.forEach { job ->
                 UUID.fromString(job.id)
                 UUID.fromString(job.recordingId)
                 job.destination.validate()
-                require(job.files.map { it.name }.toSet() == setOf("audio.m4a", "transcript.json"))
-                require(job.files.size == 2)
+                val expected = if (job.diagnostics) setOf("diagnostics.json") else setOf("audio.m4a", "transcript.json")
+                require(job.files.map { it.name }.toSet() == expected)
+                require(job.files.size == expected.size)
                 job.files.forEach { file ->
                     require(file.size >= 0 && Regex("[0-9a-f]{64}").matches(file.checksum))
                     file.objectId?.let { UUID.fromString(it) }
@@ -515,13 +582,37 @@ class Transfers(val root: File) {
     fun save(d: Destination) {
         d.validate()
         val old = ledger
-        ledger = Ledger(d, jobs)
+        ledger = ledger.copy(destination = d)
         try {
             persist()
         } catch (e: Exception) {
             ledger = old
             throw e
         }
+    }
+
+    fun setMode(mode: DialogueMode) {
+        val old = ledger
+        ledger = ledger.copy(routing = ledger.routing.copy(mode = mode))
+        try { persist() } catch (e: Exception) { ledger = old; throw e }
+    }
+
+    fun saveRoute(d: Destination, mode: DialogueMode) {
+        d.validate()
+        require(mode != DialogueMode.Agent || d.recipient != null) { "Choose a canonical receiving agent." }
+        val old = ledger
+        ledger = when (mode) {
+            DialogueMode.Normal -> ledger.copy(destination = d)
+            DialogueMode.Channel -> ledger.copy(routing = ledger.routing.copy(channel = d.copy(recipient = null, recipientLabel = null)))
+            DialogueMode.Agent -> ledger.copy(routing = ledger.routing.copy(agent = d))
+        }.let { it.copy(routing = it.routing.copy(mode = mode)) }
+        try { persist() } catch (e: Exception) { ledger = old; throw e }
+    }
+
+    fun setupSeed(mode: DialogueMode, signer: String?): Destination? {
+        val own = ledger.routing.copy(mode = mode).destination(destination)
+        return (listOfNotNull(own, destination, ledger.routing.channel, ledger.routing.agent))
+            .firstOrNull { it.signer == signer }
     }
 
     fun protects(id: String) =
@@ -601,7 +692,7 @@ class Transfers(val root: File) {
     ): Transfer {
         check(readable)
         d.validate()
-        check(r.state == "saved" && r.speech == "complete") {
+        check(r.state == "saved" && (r.audioOnly || r.speech == "complete")) {
             "Complete capture and transcription required; files retained."
         }
         val dir = directory(id)
@@ -619,8 +710,12 @@ class Transfers(val root: File) {
                     put("title", r.title)
                     put("created_at", java.time.Instant.ofEpochMilli(r.created).toString())
                     put("duration_seconds", r.durationMs / 1000.0)
-                    put("raw_transcript", r.raw.orEmpty())
-                    put("corrected_transcript", reviewed)
+                    put("transcription_status", if (r.audioOnly) "not_requested" else "complete")
+                    put("transcript_attached", !r.audioOnly)
+                    if (!r.audioOnly) {
+                        put("raw_transcript", r.raw.orEmpty())
+                        put("corrected_transcript", reviewed)
+                    }
                     put("events", JsonArray(r.events.map(::JsonPrimitive)))
                     put("prompt", d.prompt)
                     put("audio_sha256", digest(a))
@@ -644,15 +739,32 @@ class Transfers(val root: File) {
                 (mention +
                         d.prompt.trim() +
                         "\n\nRecording: ${r.title}\n\n" +
-                        reviewed.take(4000) +
-                        "\n\nFull original and corrected transcript and complete audio are attached.")
+                        (if (r.audioOnly) "The attached audio is the source recording. Please transcribe and process it on the agent/server. No transcript is attached."
+                         else reviewed.take(4000) + "\n\nFull original and corrected transcript and complete audio are attached."))
                     .trim()
-            val job = Transfer(id, r.id, d, r.title, body, files)
+            val job = Transfer(id, r.id, d, r.title, body, files, route = r.dialogueRoute)
             return job
         } catch (e: Exception) {
             dir.deleteRecursively()
             throw e
         }
+    }
+
+    fun snapshotDiagnostics(d: Destination, report: String): Transfer {
+        check(readable)
+        d.validate()
+        // Decode the closed schema so callers cannot sneak arbitrary report fields into a snapshot.
+        val clean = codec.encodeToString(codec.decodeFromString<DiagnosticReport>(report))
+        val id = uuid()
+        val dir = directory(id).apply { mkdirs() }
+        try {
+            val file = File(dir, "diagnostics.json")
+            atomic(file, clean)
+            val job = Transfer(id = id, recordingId = uuid(), destination = d,
+                title = "In Dialogue diagnostics", body = "Private operational diagnostics from In Dialogue. No audio, transcript, message or key content.",
+                files = listOf(TransferFile(file.name, "application/json", file.length(), digest(file))), diagnostics = true)
+            return commitSnapshot(job)
+        } catch (e: Exception) { dir.deleteRecursively(); throw e }
     }
 
     fun retry(job: Transfer) {
@@ -767,6 +879,7 @@ class Transfers(val root: File) {
         job.messageId =
             result["message"]!!.jsonObject.text("id")
                 ?: error("Message result uncertain; retry same request ID.")
+        job.threadId = result["message"]!!.jsonObject.text("thread_id") ?: result["thread"]?.jsonObject?.text("id") ?: job.route?.threadId
         job.state = "sent"
         job.notice = null
         persist()

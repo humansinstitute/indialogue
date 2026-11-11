@@ -27,6 +27,7 @@ class NStackSetup(
     private val loadWorkspaces: suspend (String, AuthContext) -> List<Choice>,
     private val loadChannels: suspend (String, Choice, AuthContext) -> NStackAPI.Discovery,
     private val saved: Destination? = null,
+    private val keepSeedChannel: Boolean = true,
 ) {
     val state = MutableStateFlow(SetupState(origin = saved?.origin.orEmpty()))
     private var connection = auth()
@@ -44,7 +45,7 @@ class NStackSetup(
             state.value =
                 state.value.copy(
                     workspace = Choice(saved.workspace, saved.workspaceLabel, saved.appNpub),
-                    channel = Choice(saved.channel, saved.channelLabel),
+                    channel = if (keepSeedChannel) Choice(saved.channel, saved.channelLabel) else null,
                     recipient = saved.recipient.orEmpty(),
                     recipientLabel = saved.recipientLabel.orEmpty(),
                 )
@@ -140,7 +141,8 @@ class NStackSetup(
         }
     }
 
-    fun selectWorkspace(choice: Choice) {
+    fun selectWorkspace(choice: Choice, preserve: Boolean = false) {
+        val retained = state.value.takeIf { preserve && it.workspace?.id == choice.id }
         val ticket =
             try {
                 begin(choice)
@@ -154,6 +156,9 @@ class NStackSetup(
                 if (valid(ticket))
                     state.value =
                         state.value.copy(
+                            channel = retained?.channel?.takeIf { it in result.channels },
+                            recipient = retained?.recipient?.takeIf { value -> result.agents.any { it.id == value } }.orEmpty(),
+                            recipientLabel = retained?.recipientLabel?.takeIf { result.agents.any { agent -> agent.id == retained.recipient } }.orEmpty(),
                             channels = result.channels,
                             agents = result.agents,
                             manualRecipient = result.directoryUnavailable,

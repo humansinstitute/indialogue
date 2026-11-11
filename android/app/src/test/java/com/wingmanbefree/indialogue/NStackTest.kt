@@ -57,6 +57,56 @@ class NStackTest {
     }
 
     @Test
+    fun followupSignatureBindsOriginalThreadAndOmitsCreateThread() {
+        val root = root()
+        try {
+            val identity = identity(root)
+            val d = destination(identity)
+            val route = DialogueRoute(d, DialogueMode.Agent, threadId = uuid(), respondingToReplyId = "previous")
+            val job = Transfer(recordingId = uuid(), destination = d, title = "Response", body = "Original response", files = emptyList(), route = route)
+            val message = NStackAPI(identity).message(job)
+            assertEquals(route.threadId, message.text("thread_id"))
+            assertNull(message["create_thread"])
+            val event = message["message_signature"]!!.jsonObject["nostr_event"]!!.jsonObject
+            assertTrue(event["tags"]!!.jsonArray.any { it.jsonArray.map { p -> p.jsonPrimitive.content } == listOf("thread_id", route.threadId) })
+            assertEquals(job.id, message.text("client_request_id"))
+        } finally { root.deleteRecursively() }
+    }
+
+    @Test
+    fun replyPaginationKeepsThreadQueryAndDownloadUsesOnlyPinnedOrigin() = runBlocking {
+        val root = root()
+        val (server, client) = server()
+        try {
+            val identity = identity(root)
+            val d = destination(identity, server.url("/").toString().trimEnd('/'))
+            val api = NStackAPI(identity, client = client)
+            server.enqueue(response("""{"messages":[],"next_cursor":"next page"}"""))
+            server.enqueue(response("""{"messages":[{"id":"reply","body":"Hello"}],"has_more":false}"""))
+            val rows = api.list(d.origin, "/api/v4/flightdeck-pg/workspaces/${d.workspace}/channels/${d.channel}/messages?thread_id=test&effective_transcript=true", "messages", d.appNpub)
+            assertEquals("reply", rows.single().text("id"))
+            repeat(2) {
+                val request = server.takeRequest()
+                assertEquals("test", request.requestUrl!!.queryParameter("thread_id"))
+                assertEquals("200", request.requestUrl!!.queryParameter("limit"))
+                assertNotNull(request.getHeader("Authorization"))
+            }
+            val objectId = uuid()
+            server.enqueue(MockResponse().setBody("audio bytes"))
+            val output = File(root, "reply.audio")
+            api.downloadAudio(d, objectId, output)
+            assertEquals("audio bytes", output.readText())
+            assertEquals("/api/v4/storage/$objectId/content", server.takeRequest().path)
+            server.enqueue(MockResponse().setResponseCode(302).setHeader("Location", "https://elsewhere.invalid/audio"))
+            assertThrows(Exception::class.java) { runBlocking { api.downloadAudio(d, objectId, output) } }
+            server.takeRequest()
+            val locked = NStackAPI(identity, { error("Identity locked") }, client)
+            assertThrows(Exception::class.java) { runBlocking { locked.downloadAudio(d, objectId, output) } }
+            assertEquals(0, server.requestCount - 4)
+        } finally { server.shutdown(); root.deleteRecursively() }
+    }
+
+    @Test
     fun immutableSnapshotSurvivesRestartAndKeepsOriginalDestination() {
         val root = root()
         try {

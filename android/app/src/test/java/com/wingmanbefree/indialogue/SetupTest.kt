@@ -8,6 +8,28 @@ class SetupTest {
     private val npub = Bech32.encode("npub", ByteArray(32).also { it[31] = 1 })
 
     @Test
+    fun sharedWorkspaceSeedRetainsOnlyAccessibleChannelAndNeverSilentlySelectsChannelMode(): Unit = runBlocking {
+        val d = Destination("https://example.com", npub, uuid(), "Workspace", npub, uuid(), "Channel", "Review")
+        val auth = AuthContext(npub, 1)
+        val workspace = Choice(d.workspace, d.workspaceLabel, d.appNpub)
+        val channel = Choice(d.channel, d.channelLabel)
+        fun setup(keep: Boolean, accessible: List<Choice>) = NStackSetup(this, { auth }, { _, _ -> listOf(workspace) },
+            { _, _, _ -> NStackAPI.Discovery(accessible, emptyList(), "", false) }, d, keepSeedChannel = keep)
+        val channelMode = setup(false, listOf(channel))
+        assertEquals(workspace, channelMode.state.value.workspace)
+        assertNull(channelMode.state.value.channel)
+        channelMode.selectWorkspace(workspace, preserve = true); yield()
+        assertNull(channelMode.state.value.channel)
+        val agentMode = setup(true, listOf(channel))
+        agentMode.selectWorkspace(workspace, preserve = true); yield()
+        assertEquals(channel, agentMode.state.value.channel)
+        val revoked = setup(true, emptyList())
+        revoked.selectWorkspace(workspace, preserve = true); yield()
+        assertNull(revoked.state.value.channel)
+        assertThrows(Exception::class.java) { revoked.destination("Review", false) }
+    }
+
+    @Test
     fun delayedWorkspaceSuccessAndErrorCannotReviveChangedOriginOrIdentity(): Unit = runBlocking {
         var auth = AuthContext(npub, 1)
         val result = CompletableDeferred<List<Choice>>()

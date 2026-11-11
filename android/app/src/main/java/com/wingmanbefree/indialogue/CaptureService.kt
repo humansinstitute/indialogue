@@ -39,6 +39,7 @@ class CaptureService : Service() {
             }
         }
     private var lastRoute: Int? = null
+    private var selectedInputVerified = false
     private val recordingCallback =
         object : AudioManager.AudioRecordingCallback() {
             override fun onRecordingConfigChanged(
@@ -62,7 +63,7 @@ class CaptureService : Service() {
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         if (intent?.action == "stop") {
-            stopCapture(null)
+            stopCapture(null, intent.getBooleanExtra("audioOnly", false))
             return START_NOT_STICKY
         }
         if (record != null) return START_NOT_STICKY
@@ -109,9 +110,11 @@ class CaptureService : Service() {
                     title =
                         java.text
                             .SimpleDateFormat("d MMM yyyy HH:mm", java.util.Locale.getDefault())
-                            .format(java.util.Date())
+                            .format(java.util.Date()),
+                    dialogueRoute = app.pendingRoute,
                 )
             app.library.save(r)
+            app.diagnostics.record(DiagnosticEvent.CaptureStarted)
             record = r
             app.active.value = r.id
             app.capturePending.value = false
@@ -188,7 +191,8 @@ class CaptureService : Service() {
         m.setAudioEncodingBitRate(96000)
         m.setOutputFile(File(app.library.directory(r.id), name).absolutePath)
         val preferred = app.preferredDevice()
-        if (preferred != null) m.setPreferredDevice(preferred)
+        check(app.preferredInput == null || preferred != null) { "Selected microphone unavailable. Reconnect it or explicitly choose System default." }
+        if (preferred != null) check(m.setPreferredDevice(preferred)) { "Android refused the selected microphone." }
         m.setOnErrorListener { _, what, extra ->
             stopCapture("Recorder error $what/$extra; earlier segments retained.")
         }
@@ -200,6 +204,13 @@ class CaptureService : Service() {
 
     private fun reportRoute() {
         val device = recorder?.routedDevice
+        val preferred = app.preferredDevice()
+        if (!inputRouteAllowed(app.preferredInput != null, preferred?.id, device?.id,
+                if (selectedInputVerified) 1000 else SystemClock.elapsedRealtime() - start)) {
+            stopCapture("Selected microphone was not verified or changed. Capture stopped; earlier audio retained. Reconnect it or explicitly choose System default.")
+            return
+        }
+        if (preferred != null && device?.id == preferred.id) selectedInputVerified = true
         app.route.value =
             device?.let { "${it.productName} · ${inputType(it.type)}" } ?: "Android route pending"
         if (device != null && device.id != lastRoute) {
@@ -225,7 +236,7 @@ class CaptureService : Service() {
         }
     }
 
-    private fun stopCapture(reason: String?) {
+    private fun stopCapture(reason: String?, audioOnly: Boolean = false) {
         timer?.cancel()
         timer = null
         var warning = reason
@@ -235,13 +246,19 @@ class CaptureService : Service() {
             warning = (warning?.plus("\n") ?: "") + "Final segment may be unreadable: ${e.message}"
         }
         record?.let { r ->
+            app.diagnostics.record(if (warning == null) DiagnosticEvent.CaptureSaved else DiagnosticEvent.CaptureInterrupted)
             r.state = if (warning == null) "saved" else "interrupted"
             if (warning != null) {
                 r.events += warning!!
                 r.notice = warning
             } else {
-                r.speech = "queued"
-                r.autoDestination = app.transfers.destination?.takeIf { it.automatic }
+                r.audioOnly = audioOnly
+                r.speech = if (audioOnly) "none" else "queued"
+                r.autoDestination = automaticDelivery(r.dialogueRoute, audioOnly)
+                if (audioOnly && r.autoDestination == null) {
+                    r.notice = "Audio saved. Configure NStack, then upload this recording from the library."
+                    app.notice.value = r.notice!!
+                }
             }
             try {
                 app.library.save(r)

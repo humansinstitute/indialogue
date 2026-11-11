@@ -10,6 +10,11 @@ import android.view.WindowManager
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.background
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.unit.sp
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
@@ -26,6 +31,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.semantics.selected
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
@@ -57,7 +63,7 @@ class MainActivity : ComponentActivity() {
         setContent {
             MaterialTheme(
                 colorScheme =
-                    lightColorScheme(primary = Color(0xff18392b), background = Color(0xfff8f3e9))
+                    lightColorScheme(primary = Color(0xff007aff), background = Color.White, surface = Color.White, surfaceContainer = Color(0xfff2f2f7))
             ) {
                 Surface(Modifier.fillMaxSize()) {
                     DialogueUI(
@@ -145,7 +151,9 @@ fun Field(
 
 @Composable
 fun Action(label: String, enabled: Boolean = true, click: () -> Unit) {
-    Button(onClick = click, enabled = enabled, modifier = Modifier.fillMaxWidth()) { Text(label) }
+    TextButton(onClick = click, enabled = enabled, modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp), shape = RoundedCornerShape(10.dp)) {
+        Text(label, modifier = Modifier.fillMaxWidth(), style = MaterialTheme.typography.bodyLarge)
+    }
 }
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -177,13 +185,15 @@ fun DialogueUI(
             unlockPrompt = false
         } else if (app.identity.exists && !app.identity.unlocked) unlockPrompt = true
     }
+    LaunchedEffect(screen, unlockPrompt) { app.replies.stop() }
     androidx.activity.compose.BackHandler(enabled = screen != "Capture") {
         screen = if (screen == "Menu") "Capture" else "Menu"
     }
     Scaffold(
         topBar = {
-            TopAppBar(
-                title = { Text(if (screen == "Capture") "In Dialogue" else screen) },
+            LargeTopAppBar(
+                colors = TopAppBarDefaults.largeTopAppBarColors(containerColor = if (screen == "Capture") Color.White else Color(0xfff2f2f7)),
+                title = { Text(if (screen == "Capture") "In Dialogue" else screen, fontWeight = FontWeight.Bold, fontSize = 34.sp) },
                 navigationIcon = {
                     TextButton(
                         onClick = {
@@ -192,7 +202,7 @@ fun DialogueUI(
                                 else if (screen == "Menu") "Capture" else "Menu"
                         }
                     ) {
-                        Text(if (screen == "Capture") "Menu" else "Back")
+                        Text(if (screen == "Capture") "☰" else "‹ Back", modifier = Modifier.semantics { contentDescription = if (screen == "Capture") "Menu" else "Back" }, fontSize = if (screen == "Capture") 26.sp else 17.sp, color = Color.Black)
                     }
                 },
             )
@@ -201,9 +211,10 @@ fun DialogueUI(
         Column(
             Modifier.padding(padding)
                 .fillMaxSize()
-                .verticalScroll(rememberScrollState())
-                .padding(20.dp),
-            verticalArrangement = Arrangement.spacedBy(14.dp),
+                .background(if (screen == "Capture") Color.White else Color(0xfff2f2f7))
+                .verticalScroll(remember(screen, selected) { androidx.compose.foundation.ScrollState(0) })
+                .padding(24.dp),
+            verticalArrangement = Arrangement.spacedBy(if (screen == "Capture") 28.dp else 8.dp),
         ) {
             if (notice.isNotBlank()) {
                 Card {
@@ -217,17 +228,23 @@ fun DialogueUI(
             @Suppress("UNUSED_VARIABLE") val observed = revision
             when (screen) {
                 "Capture" -> {
-                    Text(
-                        "Private audio. Your words, on your device.",
-                        style = MaterialTheme.typography.titleLarge,
-                    )
+                    Row(Modifier.fillMaxWidth().background(Color(0xffeeeeef), RoundedCornerShape(50.dp)).padding(3.dp)) {
+                        DialogueMode.entries.forEach { mode ->
+                            TextButton(
+                                onClick = { app.action { app.transfers.setMode(mode); app.refresh() } },
+                                enabled = active == null && !pending,
+                                modifier = Modifier.weight(1f).heightIn(min = 36.dp)
+                                    .background(if (app.transfers.ledger.routing.mode == mode) Color.White else Color.Transparent, RoundedCornerShape(50.dp))
+                                    .semantics { this.selected = app.transfers.ledger.routing.mode == mode },
+                                colors = ButtonDefaults.textButtonColors(contentColor = Color.Black),
+                            ) { Text(mode.name, fontWeight = FontWeight.SemiBold) }
+                        }
+                    }
                     var inputs by remember { mutableStateOf(false) }
-                    Action("Microphone preference: " + app.inputLabel(), active == null) {
-                        permission {
-                            if (it) inputs = true
-                            else
-                                app.notice.value =
-                                    "Microphone permission denied. Enable it in Android Settings to record."
+                    OutlinedButton(onClick = { permission { if (it) inputs = true else app.notice.value = "Microphone permission denied. Enable it in Android Settings." } }, enabled = active == null && !pending, modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp), shape = RoundedCornerShape(50.dp), colors = ButtonDefaults.outlinedButtonColors(containerColor = Color(0xffeaeaed), contentColor = Color.Gray), border = null) {
+                        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            ControlIcon("microphone", Modifier.size(20.dp), Color.Gray)
+                            Column { Text(if (active == null) "No active input" else route, style = MaterialTheme.typography.labelMedium); Text(app.inputLabel(), style = MaterialTheme.typography.bodySmall) }
                         }
                     }
                     if (inputs) {
@@ -254,7 +271,7 @@ fun DialogueUI(
                             }
                         }
                     }
-                    Text("Actual input: $route")
+
                     if (active != null) {
                         Text(
                             "%02d:%02d".format(elapsed / 60000, (elapsed / 1000) % 60),
@@ -271,7 +288,7 @@ fun DialogueUI(
                             val width = size.width / 40
                             levels.forEachIndexed { i, v ->
                                 drawLine(
-                                    Color(0xff18392b),
+                                    Color(0xff007aff),
                                     Offset(
                                         (40 - levels.size + i) * width,
                                         size.height * (1 - v) / 2,
@@ -284,33 +301,75 @@ fun DialogueUI(
                                 )
                             }
                         }
-                        Action("Stop and save") { app.stopCapture() }
-                    } else
-                        Action("Start recording") {
+                        PrimaryRecordingButton("Stop, upload & publish audio", !pending) { app.stopCapture(audioOnly = true) }
+                        OutlinedButton(onClick = { app.stopCapture() }, modifier = Modifier.fillMaxWidth().heightIn(min = 56.dp), shape = RoundedCornerShape(10.dp)) {
+                            Text("Stop and transcribe locally")
+                        }
+                    } else {
+                        PrimaryRecordingButton(if (pending) "Preparing recording…" else "New recording", !pending) {
                             permission {
                                 if (it) app.startCapture()
-                                else
-                                    app.notice.value =
-                                        "Microphone permission denied. Recordings are retained; enable permission in Android Settings."
+                                else app.notice.value = "Microphone permission denied. Enable it in Android Settings to record."
                             }
                         }
-                    Text(
-                        "Recording continues with a microphone notification while backgrounded. Android may stop capture on interruption, input loss, force stop, reboot or low storage. Earlier saved segments are recovered.",
-                        style = MaterialTheme.typography.bodySmall,
-                    )
+                        ConversationView(app, visible = !unlockPrompt, permission = permission)
+                    }
                 }
+
                 "Menu" -> {
-                    listOf(
-                            "Recordings",
-                            "Models",
-                            "Vocabulary",
-                            "Identity",
-                            "NStack",
-                            "NStack uploads",
-                            "Settings",
-                        )
-                        .forEach { item -> Action(item) { screen = item } }
-                    Text("In Dialogue 1.0.0 · native Android")
+                    GroupedSection("Preferences") {
+                        listOf("NStack", "NStack uploads", "Identity", "Reply voice", "Settings", "Vocabulary", "Notices and status", "Models").forEach { item ->
+                            TextButton(onClick = { screen = item }, modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp)) {
+                                Text(item, Modifier.weight(1f), color = Color.Black)
+                                Text("›", color = Color.Gray)
+                            }
+                            HorizontalDivider(color = Color(0xffe5e5ea))
+                        }
+                    }
+                    GroupedSection("Diagnostics") {
+                        Action("Send diagnostics") { app.sendDiagnostics() }
+                        Text("Manually sends the last hour of operational events as a private report to the current NStack destination. No audio, transcript, message content or keys. Unlock the matching identity first. Pending reports survive relaunch; retry in NStack uploads.", Modifier.padding(16.dp), style = MaterialTheme.typography.bodySmall)
+                    }
+                    GroupedSection("Recordings · ${recordings.size}") {
+                        if (recordings.isEmpty()) Text("No saved recordings.", Modifier.padding(16.dp), color = Color.Gray)
+                        recordings.forEach { r ->
+                            Column(Modifier.fillMaxWidth().clickable { selected = r.id; screen = "Recording" }.padding(16.dp)) {
+                                Text(r.title, fontWeight = FontWeight.SemiBold)
+                                Text("${r.durationMs / 1000}s · ${r.state.replaceFirstChar { it.uppercase() }}", style = MaterialTheme.typography.bodySmall, color = Color.Gray)
+                                r.notice?.let { Text(it, style = MaterialTheme.typography.bodySmall) }
+                            }
+                            HorizontalDivider(color = Color(0xffe5e5ea))
+                        }
+                    }
+                    Text("In Dialogue ${BuildConfig.VERSION_NAME} · native Android", style = MaterialTheme.typography.bodySmall, color = Color.Gray)
+                }
+                "Reply voice" -> {
+                    LaunchedEffect(Unit) {
+                        try { app.replies.prepareVoices() }
+                        catch (e: kotlinx.coroutines.CancellationException) { throw e }
+                        catch (e: Exception) { app.notice.value = e.message ?: "Android reply voices unavailable." }
+                    }
+                    GroupedSection("Reply playback") {
+                        Row(Modifier.padding(16.dp), verticalAlignment = Alignment.CenterVertically) {
+                            Text("Automatically listen to new replies", Modifier.weight(1f))
+                            Switch(app.replies.autoListen, app.replies::saveAutoListen)
+                        }
+                        Text("Attached audio plays first. Text-only replies use the Android system voice. Configure installed voices and offline voice data in Android text-to-speech settings.", Modifier.padding(16.dp))
+                        Action("System default voice${if (app.replies.selectedVoice == null) " ✓" else ""}") { app.replies.chooseVoice(null) }
+                        app.replies.voices.forEach { voice ->
+                            Action("${voice.locale.displayName} · ${voice.name}${if (app.replies.selectedVoice == voice.name) " ✓" else ""}") { app.replies.chooseVoice(voice.name) }
+                        }
+                        Action("Preview voice") { app.replies.preview() }
+                        Action("Stop preview") { app.replies.stop() }
+                        Text(app.replies.notice)
+                        Action("Android voice settings") { app.action { context.startActivity(Intent("com.android.settings.TTS_SETTINGS")) } }
+                    }
+                }
+                "Notices and status" -> {
+                    Text(notice.ifBlank { "No recorder notices." })
+                    Text(modelStatus)
+                    Text(app.replies.notice)
+                    Text("Transcription and authenticated uploads resume while the app is active and capture is idle. Audio is retained after failures.")
                 }
                 "Recordings" -> {
                     if (recordings.isEmpty()) Text("Your saved recordings will appear here.")
@@ -359,9 +418,9 @@ fun DialogueUI(
                         "Downloads contact Alpha Cephei or Hugging Face only when requested. Recording and installed-model inference work offline."
                     )
                 }
-                "Vocabulary" -> VocabularyView(app)
-                "Identity" -> IdentityView(app)
-                "NStack" -> NStackView(app)
+                "Vocabulary" -> SettingsGroup { VocabularyView(app) }
+                "Identity" -> SettingsGroup { IdentityView(app) }
+                "NStack" -> SettingsGroup { NStackView(app) }
                 "NStack uploads" -> {
                     if (!app.transfers.readable)
                         Text("Upload ledger unreadable; original files retained.")
@@ -380,6 +439,9 @@ fun DialogueUI(
                                 Text(j.state)
                                 j.notice?.let { Text(it) }
                                 j.messageId?.let { Text("Message: $it") }
+                                if (j.diagnostics && j.state in setOf("sent", "cancelled")) {
+                                    Action("Remove finished local report") { app.action { app.transfers.deleteFinished(j.recordingId); app.refresh() } }
+                                }
                                 if (j.state !in setOf("sent", "cancelled")) {
                                     Action("Retry same snapshot") { app.retryUpload(j) }
                                     Action("Cancel local delivery") { app.cancelUpload(j) }
@@ -391,7 +453,7 @@ fun DialogueUI(
                         "Retry keeps original identity, content, destination and request ID. Cancellation cannot retract remotely committed messages or storage."
                     )
                 }
-                "Settings" -> SettingsView(app)
+                "Settings" -> SettingsGroup { SettingsView(app) }
             }
         }
     }
@@ -521,7 +583,9 @@ fun RecordingView(app: DialogueApp, r: Recording, share: (List<File>) -> Unit) {
         }
         Action("Reject cleanup draft") { app.action { app.update(r.id) { it.rejectDraft() } } }
     }
-    Action("Upload / Retry upload", r.state == "saved") { app.upload(r.id) }
+    Text("NStack delivery", style = MaterialTheme.typography.titleMedium)
+    Action("Upload corrected transcript and audio", r.state == "saved" && r.speech == "complete") { app.upload(r.id) }
+    Action("Upload audio for agent/server transcription", r.state == "saved") { app.upload(r.id, audioOnly = true) }
     if (r.autoDestination != null) {
         Text("Automatic delivery intent is retained for the destination selected at save time.")
         Action("Cancel automatic delivery intent") {
@@ -775,8 +839,11 @@ fun SettingsView(app: DialogueApp) {
 fun NStackView(app: DialogueApp) {
     val scope = rememberCoroutineScope()
     val epoch by app.identity.generation.collectAsState()
-    val saved = app.transfers.destination
-    val setup = remember {
+    var mode by remember { mutableStateOf(app.transfers.ledger.routing.mode) }
+    val own = app.transfers.ledger.routing.copy(mode = mode).destination(app.transfers.destination)?.takeIf { app.identity.unlocked && it.signer == app.identity.npub() }
+    val seed = app.transfers.setupSeed(mode, if (app.identity.unlocked) app.identity.npub() else null)
+    val saved = own ?: seed?.copy(recipient = null, recipientLabel = null)
+    val setup = remember(mode, epoch) {
         fun current() =
             AuthContext(
                 if (app.identity.unlocked) app.identity.npub() else null,
@@ -803,12 +870,22 @@ fun NStackView(app: DialogueApp) {
             { origin, auth -> api(auth).workspaces(origin) },
             { origin, w, auth -> api(auth).discover(origin, w) },
             saved,
+            keepSeedChannel = own != null || mode != DialogueMode.Channel,
         )
     }
-    LaunchedEffect(epoch) { setup.refreshIdentity() }
+    LaunchedEffect(setup) {
+        setup.refreshIdentity()
+        setup.state.value.workspace?.let { setup.selectWorkspace(it, preserve = true) }
+    }
     val state by setup.state.collectAsState()
-    var prompt by remember { mutableStateOf(saved?.prompt ?: "Please review this recording.") }
-    var automatic by remember { mutableStateOf(saved?.automatic ?: false) }
+    var prompt by remember(mode, epoch) { mutableStateOf(saved?.prompt ?: "Please review this recording.") }
+    var automatic by remember(mode, epoch) { mutableStateOf(saved?.automatic ?: false) }
+    Row(Modifier.fillMaxWidth()) {
+        DialogueMode.entries.forEach { choice ->
+            FilterChip(selected = mode == choice, onClick = { mode = choice }, label = { Text(choice.name) }, modifier = Modifier.weight(1f))
+        }
+    }
+    Text("Connection", style = MaterialTheme.typography.titleMedium)
     Field("https://your-nstack.example", state.origin, setup::setOrigin)
     Text(
         if (app.identity.unlocked) app.identity.npub()
@@ -842,11 +919,11 @@ fun NStackView(app: DialogueApp) {
     Text(
         "Existing recordings require Upload. Automatic delivery retains the destination selected at save time. Setup does not join or create channels."
     )
-    Action("Save NStack setup", app.identity.unlocked && !state.busy) {
+    Action("Save ${mode.name} route", app.identity.unlocked && !state.busy) {
         app.action {
-            app.transfers.save(setup.destination(prompt, automatic))
+            app.transfers.saveRoute(setup.destination(prompt, automatic), mode)
             app.notice.value =
-                "NStack setup saved. Automatic delivery applies only to future recordings."
+                "Route saved. Future recordings copy this destination; existing recordings keep their original route."
         }
     }
 }
