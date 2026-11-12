@@ -275,6 +275,15 @@ class Identity(private val file: File, private val installation: InstallationSec
 
     @Synchronized fun npub(): String = Bech32.encode("npub", publicKey())
 
+    @Synchronized fun encryptSelf(content: String): String {
+        val key = Nip44.conversationKey(checkNotNull(secret), publicKey().hex())
+        return try { Nip44.encrypt(content, key) } finally { key.fill(0) }
+    }
+    @Synchronized fun decryptSelf(content: String): String {
+        val key = Nip44.conversationKey(checkNotNull(secret), publicKey().hex())
+        return try { Nip44.decrypt(content, key) } finally { key.fill(0) }
+    }
+
     private fun publicKey() =
         Secp256k1.pubkeyCreate(checkNotNull(secret) { "Unlock identity first." }).copyOfRange(1, 33)
 

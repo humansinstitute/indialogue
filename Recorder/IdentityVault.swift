@@ -158,6 +158,21 @@ final class IdentityVault {
         let signature = try key.signature(message: &digest, auxiliaryRand: &auxiliary)
         return NostrEvent(id: NostrCodec.hash(serialized), pubkey: pubkey, created_at: createdAt, kind: kind, tags: tags, content: content, sig: Data(signature.dataRepresentation).hex)
     }
+    func conversationKey() throws -> Data {
+        guard let clear else { throw VaultError.unavailable }
+        let privateKey = try P256K.KeyAgreement.PrivateKey(dataRepresentation: clear)
+        let pub = try P256K.Schnorr.PrivateKey(dataRepresentation:clear)
+        let peer = try P256K.KeyAgreement.PublicKey(dataRepresentation:Data([2]) + Data(pub.xonly.bytes),format:.compressed)
+        return NIP44.hmac(Data("nip44-v2".utf8),Data(privateKey.sharedSecretFromKeyAgreement(with:peer).bytes).suffix(32))
+    }
+    func decryptSelf(_ content: String) throws -> Data {
+        var key = try conversationKey(); defer { key.resetBytes(in:0..<key.count) }
+        return try NIP44.decrypt(content,key:key)
+    }
+    func encryptSelf(_ content: Data) throws -> String {
+        var key = try conversationKey(); defer { key.resetBytes(in:0..<key.count) }
+        return try NIP44.encrypt(content,key:key)
+    }
     func remove() throws {
         lock()
         if exists { try FileManager.default.removeItem(at: url) }
@@ -167,6 +182,7 @@ final class IdentityVault {
 
 @MainActor
 final class IdentityModel: ObservableObject {
+    @Published private(set) var generation = 0
     @Published private(set) var exists = false
     @Published private(set) var unlocked = false
     @Published var notice: String?
@@ -178,11 +194,14 @@ final class IdentityModel: ObservableObject {
         exists = vault?.exists == true
     }
     func perform(_ operation: (IdentityVault) throws -> Void) {
+        generation += 1
         guard let vault else { notice = "Identity storage unavailable."; return }
         do { try operation(vault); notice = nil } catch { notice = error.localizedDescription }
         exists = vault.exists; unlocked = vault.isUnlocked; npub = try? vault.signerNpub()
     }
-    func lock() { vault?.lock(); unlocked = false; npub = nil }
+    func lock() { generation += 1; vault?.lock(); unlocked = false; npub = nil }
+    func encryptSelf(_ content: Data) throws -> String { guard let vault else { throw VaultError.unavailable }; return try vault.encryptSelf(content) }
+    func decryptSelf(_ content: String) throws -> Data { guard let vault else { throw VaultError.unavailable }; return try vault.decryptSelf(content) }
     func sign(kind: Int, tags: [[String]], content: String) throws -> NostrEvent {
         guard let vault else { throw VaultError.unavailable }
         return try vault.sign(kind: kind, tags: tags, content: content)

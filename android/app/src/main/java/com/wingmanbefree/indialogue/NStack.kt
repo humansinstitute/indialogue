@@ -107,7 +107,7 @@ data class Ledger(
     val routing: Routing = Routing(),
 )
 
-data class Choice(val id: String, val label: String, val app: String = "")
+data class Choice(val id: String, val label: String, val app: String = "", val locator: WorkspaceLocator? = null)
 
 fun JsonObject.text(key: String): String? =
     (this[key] as? JsonPrimitive)?.takeIf { it.isString }?.content
@@ -287,7 +287,9 @@ class NStackAPI(
         val out = mutableListOf<JsonObject>()
         val seen = mutableSetOf<String>()
         var cursor: String? = null
+        var pages = 0
         do {
+            check(++pages <= 100) { "Discovery page limit exceeded" }
             val r =
                 request(
                     origin,
@@ -302,20 +304,26 @@ class NStackAPI(
             if (cursor != null)
                 check(cursor.isNotBlank() && seen.add(cursor)) { "Discovery cursor loop" }
             else
-                check(r["has_more"] != JsonPrimitive(true) && page.size < 200) {
+                check(r["has_more"] != JsonPrimitive(true) && r["partial"] != JsonPrimitive(true) && page.size < 200) {
                     "Discovery capped without continuation; cannot confirm complete."
                 }
         } while (cursor != null)
         return out
     }
 
-    suspend fun workspaces(origin: String) =
-        list(origin, "/api/v4/flightdeck-pg/workspaces", "workspaces").map {
-            val i = it["identity"]!!.jsonObject
-            Choice(i.text("workspace_id")!!, it.text("label")!!, i.text("app_npub")!!).also { c ->
-                UUID.fromString(c.id)
-                require(Bech32.validPublic(c.app))
-            }
+    suspend fun verify(w: WorkspaceLocator) {
+        val me = request(w.origin, "/api/v4/flightdeck-pg/workspaces/${w.workspace}/me", w.app)
+        val i = me["identity"] as? JsonObject ?: error("Membership identity missing")
+        check(WorkspaceLocator.keys.all { i[it] == w.identity[it] }) { "Workspace membership identity mismatch" }
+    }
+
+    suspend fun workspaces(origin: String): List<Choice> =
+        list(origin, "/api/v4/flightdeck-pg/workspaces", "workspaces").map { row ->
+            val raw = row["locator"] as? JsonObject ?: row["workspace_locator"] as? JsonObject ?: row
+            val i = raw["identity"] as? JsonObject ?: raw
+            val w = WorkspaceLocator.parse(JsonObject(raw + mapOf("type" to JsonPrimitive("wingman_workspace_locator"), "version" to JsonPrimitive(1), "tower_base_url" to JsonPrimitive(NStackAPI.origin(origin)), "identity" to i, "label" to JsonPrimitive(row.text("label") ?: row.text("name") ?: "Workspace"))))
+            verify(w)
+            w.choice()
         }
 
     data class Discovery(
@@ -326,6 +334,7 @@ class NStackAPI(
     )
 
     suspend fun discover(origin: String, w: Choice): Discovery {
+        w.locator?.let { verify(it) }
         val base = "/api/v4/flightdeck-pg/workspaces/${w.id}"
         val notes = mutableListOf<String>()
         var unavailable = false

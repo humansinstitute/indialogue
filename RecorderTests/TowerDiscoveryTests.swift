@@ -1,0 +1,193 @@
+import XCTest
+import P256K
+@testable import PeteRecorder
+
+@MainActor
+final class TowerDiscoveryTests: XCTestCase {
+    let appPub="79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798"
+    var npub: String { NostrCodec.npub(SelfIndexes.hex(appPub)!) }
+    func locator(_ origin:String="https://a.example",id:String="11111111-1111-4111-8111-111111111111",nested:Bool=false) -> [String:Any] {
+        let identity=["tower_service_npub":npub,"workspace_service_npub":npub,"workspace_owner_npub":npub,"app_npub":npub,"workspace_id":id]
+        var raw:[String:Any]=["type":"wingman_workspace_locator","version":1,"tower_base_url":origin,"label":"Synthetic"]
+        if nested { raw["identity"]=identity } else { identity.forEach { raw[$0.key]=$0.value } };return raw
+    }
+    func event(_ raw:[String:Any],time:Int=100,deleted:Bool=false,unreadable:Bool=false,version:Any=1,duplicateRecipient:Bool=false) throws -> NostrEvent {
+        let key=try P256K.Schnorr.PrivateKey(dataRepresentation:Data(repeating:0,count:31)+Data([3]))
+        let pub=Data(key.xonly.bytes).hex;let w=try WorkspaceLocator.parse(raw)
+        let payload:[String:Any]=["type":"flightdeck_workspace_self_index","version":version,"user_npub":NostrCodec.npub(Data(key.xonly.bytes)),"app":["app_pubkey":appPub,"app_npub":npub,"namespace":"flightdeck_pg"],"workspace":raw,"state":["deleted":deleted]]
+        let content=unreadable ? "unreadable" : String(decoding:try NostrCodec.json(payload),as:UTF8.self)
+        let d="fd-self:"+NostrCodec.hash(Data("v1:\(pub):\(appPub):\(w.tower):\(w.workspace)".utf8))
+        var tags=[["d",d],["p",pub],["app_pub",appPub],["protocol","workspace-self-index"],["v","1"]]
+        if duplicateRecipient { tags.append(["p",pub]) }
+        let bytes=try NostrCodec.json([0,pub,time,33356,tags,content]);let id=NostrCodec.hash(bytes)
+        var digest=Array(SelfIndexes.hex(id)!);var aux=[UInt8](repeating:0,count:32)
+        let sig=try key.signature(message:&digest,auxiliaryRand:&aux)
+        return NostrEvent(id:id,pubkey:pub,created_at:time,kind:33356,tags:tags,content:content,sig:Data(sig.dataRepresentation).hex)
+    }
+    func testSharedNostrToolsEncryptedFixture() throws {
+        let fixture=try XCTUnwrap(JSONSerialization.jsonObject(with:Data(Self.fixture.utf8)) as? [String:Any])
+        let pub=try XCTUnwrap(fixture["user_pubkey"] as? String)
+        let events=try JSONDecoder().decode([NostrEvent].self,from:NostrCodec.json(fixture["events"]!))
+        let privateKey=try P256K.KeyAgreement.PrivateKey(dataRepresentation:Data(repeating:0,count:31)+Data([1]))
+        let peer=try P256K.KeyAgreement.PublicKey(dataRepresentation:Data([2])+SelfIndexes.hex(pub)!,format:.compressed)
+        let key=NIP44.hmac(Data("nip44-v2".utf8),Data(privateKey.sharedSecretFromKeyAgreement(with:peer).bytes).suffix(32))
+        let decrypt:(String)throws->Data={try NIP44.decrypt($0,key:key)}
+        XCTAssertEqual(Set(SelfIndexes.candidates(Array(events.prefix(2)),pub:pub,decrypt:decrypt).map(\.origin)),Set(["https://one.example","https://two.example"]))
+        XCTAssertEqual(SelfIndexes.candidates(events,pub:pub,decrypt:decrypt).map(\.origin),["https://two.example"])
+    }
+    func testCrossAppFlatNestedAndTombstoneReduction() throws {
+        let a=try event(locator());let b=try event(locator("https://b.example",id:"22222222-2222-4222-8222-222222222222",nested:true))
+        XCTAssertNil(SelfIndexes.filter(a.pubkey)["#app_pub"])
+        let decode:(String)throws->Data={Data($0.utf8)}
+        XCTAssertEqual(Set(SelfIndexes.candidates([a,b],pub:a.pubkey,decrypt:decode,now:100).map(\.origin)),Set(["https://a.example","https://b.example"]))
+        let tomb=try event(locator(),time:101,deleted:true)
+        XCTAssertEqual(SelfIndexes.candidates([a,b,tomb],pub:a.pubkey,decrypt:decode,now:101).map(\.origin),["https://b.example"])
+        let replacement=try event(locator(),time:102,unreadable:true)
+        XCTAssertTrue(SelfIndexes.candidates([a,replacement],pub:a.pubkey,decrypt:decode,now:102).isEmpty)
+        XCTAssertTrue(SelfIndexes.candidates([try event(locator(),version:true)],pub:a.pubkey,decrypt:decode,now:100).isEmpty)
+        var invalidLocator=locator();invalidLocator["version"]=true;XCTAssertThrowsError(try WorkspaceLocator.parse(invalidLocator))
+        XCTAssertTrue(SelfIndexes.candidates([a,try event(locator(),time:103,duplicateRecipient:true)],pub:a.pubkey,decrypt:decode,now:103).isEmpty)
+        let tamper=NostrEvent(id:a.id,pubkey:a.pubkey,created_at:a.created_at,kind:a.kind,tags:a.tags,content:a.content,sig:String(repeating:"0",count:128))
+        XCTAssertTrue(SelfIndexes.candidates([tamper],pub:a.pubkey,decrypt:decode,now:100).isEmpty)
+    }
+    func testPublicNamespaceLiftsToCurveAndMatchesVersionedLabel() throws {
+        _ = try P256K.KeyAgreement.PublicKey(dataRepresentation:Data([2])+SelfIndexes.hex(SelfIndexes.appPub)!,format:.compressed)
+        XCTAssertEqual(SelfIndexes.appPub,NostrCodec.hash(Data("org.wingman.nstack.app:com.wingmanbefree.indialogue:v1:0".utf8)))
+    }
+    func testNip44AuthenticationAndPadding() throws {
+        // Independent nostr-tools NIP44 v2 fixture: public synthetic scalar 3, self peer, nonce of 32 ones.
+        let fixtureKey=SelfIndexes.hex("fc5e31fe0006369674bb81fb7aab0a54241d5ac42f631399d51a8ed0f888c300")!
+        XCTAssertEqual(String(decoding:try NIP44.decrypt("AgEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBFRTaG/tNVtJqu3n1o59bKaoZeCDxr+DxvowrTDBpWKpPkcpAGQ3r1JTe7MCBqcyfY8pfDPBZ+uT9O7Vp/p8lj1/L",key:fixtureKey),as:UTF8.self),"Synthetic cross-app locator")
+        let key=Data(repeating:3,count:32);let clear=Data("Synthetic cross-app locator 🐦".utf8)
+        let cipher=try NIP44.encrypt(clear,key:key,nonce:Data(repeating:1,count:32))
+        XCTAssertEqual(try NIP44.decrypt(cipher,key:key),clear)
+        XCTAssertThrowsError(try NIP44.decrypt(cipher,key:Data(repeating:4,count:32)))
+        XCTAssertThrowsError(try NIP44.decrypt(String(cipher.dropLast(4))+"AAAA",key:key))
+    }
+    func testSelectedTowerWorkspacePaginationAndFreshMembership() async throws {
+        let config=URLSessionConfiguration.ephemeral;config.protocolClasses=[MockNStackProtocol.self]
+        let api=NStackAPI(session:URLSession(configuration:config)) { kind,tags,content in NostrEvent(id:"0",pubkey:self.appPub,created_at:1,kind:kind,tags:tags,content:content,sig:"0") }
+        let first=locator();let second=locator(id:"22222222-2222-4222-8222-222222222222",nested:true)
+        var requests=[String]()
+        MockNStackProtocol.handler={ request in
+            XCTAssertEqual(request.url?.host,"a.example");requests.append(request.url!.path)
+            if request.url!.path.hasSuffix("/me") {
+                XCTAssertEqual(request.value(forHTTPHeaderField:"x-flightdeck-pg-app-npub"),self.npub)
+                let w=try WorkspaceLocator.parse(request.url!.path.contains("11111111") ? first : second)
+                return (200,["identity":w.identity])
+            }
+            let cursor=URLComponents(url:request.url!,resolvingAgainstBaseURL:false)?.queryItems?.first(where:{$0.name == "cursor"})?.value
+            if cursor == nil { return (200,["workspaces":[first],"next_cursor":"next page"]) }
+            XCTAssertEqual(cursor,"next page");return (200,["workspaces":[second],"has_more":false])
+        }
+        let result=try await api.workspaces(origin:"https://a.example")
+        XCTAssertEqual(result.count,2);XCTAssertEqual(requests.filter{$0.hasSuffix("/me")}.count,2)
+        MockNStackProtocol.handler={ _ in (200,["identity":["workspace_id":"wrong"]]) }
+        await XCTAssertThrowsAsync { try await api.verify(WorkspaceLocator.parse(first)) }
+    }
+    private func XCTAssertThrowsAsync(_ operation: () async throws -> Void) async { do { try await operation();XCTFail("Expected refusal") } catch { } }
+
+    // Generated from the same public nostr-tools interop fixture as Android resources.
+    static let fixture = #"""
+{
+  "description": "Disposable interop fixture signed/encrypted with public test scalar 1. No user identity. First two events are two Towers; third tombstones the first.",
+  "user_pubkey": "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
+  "user_npub": "npub10xlxvlhemja6c4dqv22uapctqupfhlxm9h8z3k2e72q4k9hcz7vqpkge6d",
+  "events": [
+    {
+      "kind": 33356,
+      "created_at": 1,
+      "tags": [
+        [
+          "d",
+          "fd-self:25375925fc896e68b0748f879528fa671b68bf27f30888474d82cc766c527831"
+        ],
+        [
+          "p",
+          "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798"
+        ],
+        [
+          "app_pub",
+          "c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5"
+        ],
+        [
+          "protocol",
+          "workspace-self-index"
+        ],
+        [
+          "v",
+          "1"
+        ]
+      ],
+      "content": "AgAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABlI2lys/XgZDF9XFNHLv1qdWmMdw4aiKIMGFJgg2yeOJ5fyojJJkxDza+L4tnz/UyszD2zEGjLfeFXsxo6TJXUHVB7nwBxdnnlPt8NpQddlm7O+XH6zxvFio9z4Wwc78I0YnouhY227G14R2lJ1jCc4o78dvutcwGL8hSgTwH+U9orutOjFE+Nso6IMGw+wrre91GSq4UVK0HT1dgkBoopIiAJyKw6ZDoJOjuJeqWY9kjCTueJP3RzR4Q+KlHn3v1D/TB68hJEsFe69QzjvS9YI/GK50j4AOUkons7BZIFsYPwBCByDbx4aDFb0wngwD9qj3yLfd1OANcdoM0aPqj6qaJun0uQr5JPpH8thhsbgkicwtt5haA8nQJBH58b56au78TFRAUQNLbkoRiRrKOsKho4gbpkE7kq46SiWNOYk4kZvYsbRe7Mj81r35QGiYqttxnzQT8KvaH7hgvmElMnP5A2S5Ly6tMhA+q9plp3GoMXadNdFvfgzxcATojfX6Z8x5UFxiQ8sERnffzfSO4PgTsBXzuZRCLZG4LCsCQFmw7O07guFnxENdatNH17zKFBADetSdVvUctKxgr895tgrZ4pDC3dPYb97AmVUq7kwrSpYi/C19Tw1cfrrSt1fF0ox6SvlOybB228SkYYdwUQ2GDko5RsxrYU4ykW6N5IoMMR4JUFEEO+sx1QcLDLW7oclYzy+9ars6pQ0XbH9vlyTc9J2haxsrQfXVBJGUgG6arCl30WuOMcX9mKTcRRtcs1/QaIB+FwEjUYZpsAq9aF9O+oPZRVy4nZf5lRvI/V/AtslT++KAgwVejSA9WUexT7fw+r9QAhQoscX1zWUfy/WaWrc0fa/aT4bKhcaCKPHDjPHm8Z2ZXhJgnj5dRp14gCEoKANH+F2/aviZCFTZA1XcWE4RYM++npd+qlbq6iXiByZxhz/uWrlSyzL+0ZVzMtqz2BBFN3WLDiJ9IWOBmHoyJL9g5BPO5mePz7Yla5otYkqXQu/ptxtP5eZmCWuuHhED+eBVtmUeCrxOZqTZRBBlwZGSegIhu8CJ3WWT7wtUFSmwvN2w8cmS78iu5t5QmTKEGCfLabH9bnHEKPGLScjzE6uW/CSM/56ijerMIiMxfmLD3mSfMNoAa7Ut8kyp0HeZonMFUyzXdhvYna9eaSJVVzmORYLvEfJbyuFq9D2fJEkJPjyQvQQyO0N61kd9QKoU4ykqbd28bcoZ3+bHfJC/YP/qQiM2OLDOfmRAkN8rMbRHGr3/SP2mctfuor+Mz29Dje6P4JQElcLBAr2MLjRJQ9XgYHn6QEJrQwD65IeF9w8Re5z5rdenTsR2ovUVHi3q936DPBp9DBehOwV89r4q884Djyze9SqFJl7TV9aioYkNvYyvPBnoB72obHeXZhX8=",
+      "pubkey": "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
+      "id": "f7b5bb2b45157a07f2fcd438d0c6ee32d17cb62d37663e77db935ddb0394847c",
+      "sig": "a03c9475a63cae4bf1814d78c6e392de2749bef52076b682793bee3625e1bce51b29f0e263430c08f04be3f5079c91911b3a5ac319a2d5e87ac3a19d68272a65"
+    },
+    {
+      "kind": 33356,
+      "created_at": 1,
+      "tags": [
+        [
+          "d",
+          "fd-self:edaa0b9643897e5979e6721703d78993b1d274e7488beb318660ea8d61c6d84f"
+        ],
+        [
+          "p",
+          "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798"
+        ],
+        [
+          "app_pub",
+          "c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5"
+        ],
+        [
+          "protocol",
+          "workspace-self-index"
+        ],
+        [
+          "v",
+          "1"
+        ]
+      ],
+      "content": "AgAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACuvSsghrqsAOaNkGNovAfRSGCrqxODTWDcdohRQAmEcaf6JlWJOCrISaDU0YXoUzdjen4xd1HzxgwCxrQBO2pp31uLjxtFhHVQvPjXa2U9ey6mHebSIbtoPozScgwKAOBSToYjvRcuV31U/IwTqSjQRY/gLkINwtRO1u3z7opBCYDQTj7Xp9seN5hGySsAzBBjW1a+nQtZkGWeP441OeYY9+joGK823mqQiCfUB0heX6HdjMzCA05+0jz3kLK+4aRrjTUbTYYw1pGV1g3udXVaValeiRmfV9h8dmgHKFM0jO20BEAcrhIEJL1gGdS8ooa1WrgKlNHYy8kAV9J2VBiI7RfBco4P2V8t+Aq2/JcUpzJQzHYR6I+n60itMyvD/SJnKaRC9YrmvhX8QD3Ob+GP6XV3i9CA4QjTsU0oYSMSxEvfojptunvpc00rqk3Hdw2cA9EhwBUdcnR/hSRGtT8arcd0MTBupch5xPFYGMZXt+EyOcYPQ+Dsd2asaYUBRVOd7vg57FeSHqNKyl8z2mDz45pSPSD/wWGAQywt4nuPPS83Y37QSxB6ApP8bxGlT814BJxirXB4yipHqARfh9NU+TrvUPBVuFV8klp1gYYyLx1oVXEu4RRGssoB4qbVhCb7W/pvWM3JNKqx3pH+2ocdjzbC5nF2kvEgsqlyvvT7Jr9oDxGudppOHfBN2+6F+E5n9vObn4nmx5v1bAUEm0+97fhoE3pVrs3aQDD7rTtHIDcOkqhmRUFJkEsyqf7WL3PndC4HS+840C6JlWLzm2JusXoS2AUVB6fBKgUYC50sQZBeIutE0Qj6COmthhsso3uX9bOxohT8Gs9Q/pgGAqMJF4juNdWz1k/uPkhlRaPm7cNY3v3C3cqBsyhBjeljDqAZarQSKG9/HA/0tSYwIaJ7UedBsduCAahIp9ag0QJCV141GYAeUEeqGt3Vn4NF8gY+b9ILzb/TujbJwFF2w1BgqsmVn22EFnQUILevq/2NDIYY7h5w1MR9Tq33UuXiVkbnFpPP6gQzwWqPAzzcBZrYZqYIWFrpm21rLYJoadp6+8bcLudTG1mX+Auaj7P0ZCJQzG2F+FREBWwpAy104XnNbYYaHwaG4gAcskhUYrfMDGbefJE/6nF7vKmDkhl34+sULei8ccZyxOZDRFvYjVv1n6Ny9EfWyuOPpgYM5HnTwyz+DVtq29zrNzQ9wWs4JUq+Gn5SbKue9E/lsWY3ox2i4VYlztSIdexHiyN7PyX59B+/v0zx5BMPqkdmn4zjccg8vQopRyAbPD8/wcJLmFcxE+BYCUSW/d0UP+bWELWcrZuNbfiNB7mBslMVlYD5f8FqPESUh0eWrD8ugiZOpKRWdZVpN5tg2LrFJdU1/h+iQV9nenjVBztrIGNE408ba8peOQ=",
+      "pubkey": "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
+      "id": "d0e0a353ade91f30234e1819feca22530eaf156f5c7b52d70554042c97625ccc",
+      "sig": "64666c77134c53d2014fa6fc428105dcae945acbfcb0fabd80aa8ce31bdb159dcf0857962a958b41dcaddc2501e368e40668d76dfed8af41ee60f5fe67351fa3"
+    },
+    {
+      "kind": 33356,
+      "created_at": 2,
+      "tags": [
+        [
+          "d",
+          "fd-self:25375925fc896e68b0748f879528fa671b68bf27f30888474d82cc766c527831"
+        ],
+        [
+          "p",
+          "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798"
+        ],
+        [
+          "app_pub",
+          "c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5"
+        ],
+        [
+          "protocol",
+          "workspace-self-index"
+        ],
+        [
+          "v",
+          "1"
+        ]
+      ],
+      "content": "AgAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAADgghP6qFXV698IrHKOYJZ6dN8WcqdTIGPzfO/aVAVYN5LIYBnV+djfjeqkHjuYKsbVBh7zbBQ5n/FhMXZoJAVeJDvMr9q7qnxEm4vD9vMNnF5P5yL3ddz5NvFIy1K2TPhLG4BH0UIEDgWiO7a1nGJPiaimdzsbSgNcWkhy7vLaLfRRsbw3evOoMat1NrdqSEI2+vtIlpttdHLXV+l7vOjYWuXR3r+uQ9eii6w77LlJbvWDcDlLQIthsiYILCVC3QPhVJCeV+7FXSmpAqemUzhV0VXOx1TdpATWV+w3SxPN2KhvEE/wCf3undN6xf+AKWlqEOobwyU6EHXGcgLKorvJz2GaOihaxi/bF7HkwWdyh2dwcGMgMLjindbm/lp6ynWA9Oo4uFbHHK2TCuviOXZroFQdQQnVDXzJMtY8rTyIvfEKnP5jjUPnebQmDCCKZDMTzBWrcce1bjuiFfopDzsolNKnOwNRgAnjCXFQ+Msrred0wMrYq+fxT1USxbdmo7qJFK5wBetUcLJyb1nffVT4k6AcbGKZQqSpbXm1V4Vv7ux4FyflgDdBjhK0SR4i3axggutEBmuXwXXKyzcwaFP6AjNtBWYDAprxM+qmqFr/kWb21xR5OQdJSDvve5HFWjpv+8o49EV6SsQ1wdcNh3W/dwzzn6a+h8jPfXcipTi2I5oIa/o0D0cdqGmaRYCMWseyssrRfPc46r1aD5ExegcmvNopHE2fAPiNtsJ0xqiw7yjBi4ysiZbTDbCuiLISkYANsVB61phGw7Dn5prqRVLRU33/3606rUHsTWCLSnyIySH38Od7pAWAb/aDYmSjANEfQ53kkru7/dW0IT1gjEugtei7ROGZHO74mRfOX6o3qcy8JWTw8KwXN3IX3GT8Qb3cn0OO3QjAOV95Ji2fi4HvTc0kL7aJxZn1jldWkZrNRapKZoajUocDcZOACU/GZ0TfLEL52D/PcCOeeWjDMXnPv15Iyb29H2i//uTTeNrGABSju7U2IgwXimOyADsCxx9zf7n1xpW5UFVYvcjYbwcGkvy36WoUOUq6lEu+FythAl8imy/rTRqtP5p/TZFgxn9Oo6C1kPuQB7rs/RGvqfUKfhofQy3cZKW0kbxS7GHj2ZHm/aiiH35LW4SzTPPF/hhEkuRBkDVtmEaRYbcOGxEiNEO+gRruVlKorxd7A3pjSUGpI3QF1xy6VR7D/0ZanuGqNs7nUbNCaXGJ74dDi3hiSOZzIb2y1QlfCzMd+tofhkqJzEo3LBdKLmXldXFoB20v/MydOO/hUIPwpZVFyh9tm6+gulsnqbHqNrImtTYjlqBucTLj6lYL9mpOnem9yg44krCPrML89jxz02q1frZEFD1ITQlFF0OkvKs3f+KJR+DscgM+eXDXNTPAURO0GslHH8=",
+      "pubkey": "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
+      "id": "4216b2e9679a755853e8d7f20cd31b9db9c77b32e685ac573535c68e412f916e",
+      "sig": "205689e9e841779e422a170b4359eba159ea7426b54cf8cc4f9042ab9e37ca3f23cb6b73f2a75dccf05cf5b6f67ac9265fe39a8bf9ba20a416bae2426300ac1b"
+    }
+  ],
+  "expected_active_origins": [
+    "https://two.example"
+  ]
+}
+"""#
+}

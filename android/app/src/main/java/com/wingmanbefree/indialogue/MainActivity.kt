@@ -871,11 +871,13 @@ fun NStackView(app: DialogueApp) {
             { origin, w, auth -> api(auth).discover(origin, w) },
             saved,
             keepSeedChannel = own != null || mode != DialogueMode.Channel,
+            publishIndex = { w, auth -> TowerDiscovery(app.identity, { check(current() == auth && app.foreground.value && app.active.value == null && !app.capturePending.value) }).publish(w) },
+            loadTowers = { auth -> TowerDiscovery(app.identity, { check(current() == auth && app.foreground.value && app.active.value == null && !app.capturePending.value) { "Discovery context changed." } }).discover() },
         )
     }
     LaunchedEffect(setup) {
         setup.refreshIdentity()
-        setup.state.value.workspace?.let { setup.selectWorkspace(it, preserve = true) }
+        if (app.identity.unlocked) setup.discoverTowers()
     }
     val state by setup.state.collectAsState()
     var prompt by remember(mode, epoch) { mutableStateOf(saved?.prompt ?: "Please review this recording.") }
@@ -891,7 +893,10 @@ fun NStackView(app: DialogueApp) {
         if (app.identity.unlocked) app.identity.npub()
         else "Unlock your imported identity in Identity settings."
     )
-    Action("Discover workspaces", app.identity.unlocked && !state.busy) { setup.discover() }
+    Action("Find my Towers", app.identity.unlocked && !state.busy) { setup.discoverTowers() }
+    state.towers.forEach { tower -> Action(tower.origin, !state.busy) { setup.selectTower(tower) } }
+    Text("Selected Tower: " + (state.selectedTower?.origin ?: "Choose above or enter an HTTPS origin"))
+    Action("List workspaces at entered Tower", app.identity.unlocked && !state.busy) { setup.discover() }
     Text("Storage workspace: " + (state.workspace?.label ?: "Choose below"))
     state.workspaces.forEach { w -> Action(w.label, !state.busy) { setup.selectWorkspace(w) } }
     Text("Message destination: " + (state.channel?.label ?: "Choose an existing channel or DM"))

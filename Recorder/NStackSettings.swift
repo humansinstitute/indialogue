@@ -1,11 +1,14 @@
 import SwiftUI
 
-struct NStackChoice: Identifiable { var id: String; var label: String; var app: String = ""; var participants: [String] = [] }
+struct NStackChoice: Identifiable { var id: String; var label: String; var app: String = ""; var participants: [String] = []; var locator: WorkspaceLocator? = nil }
 struct NStackSettings: View {
     @ObservedObject var transfers: NStackTransfers
     @ObservedObject var identity: IdentityModel
     @State private var origin = ""
     @State private var workspaces: [NStackChoice] = []
+    @State private var towers: [TowerChoice] = []
+    @State private var selectedTower: TowerChoice?
+    @State private var discoveryGeneration = UUID()
     @State private var channels: [NStackChoice] = []
     @State private var agents: [NStackChoice] = []
     @State private var manualRecipient = false
@@ -25,7 +28,13 @@ struct NStackSettings: View {
         self.transfers = transfers; self.identity = identity
         _captureMode = State(initialValue:transfers.routing.mode)
     }
-    private var api: NStackAPI { NStackAPI { try identity.sign(kind:$0,tags:$1,content:$2) } }
+    private var api: NStackAPI {
+        let epoch=identity.generation
+        return NStackAPI { kind,tags,content in
+            guard identity.generation == epoch,identity.unlocked else { throw VaultError.unavailable }
+            return try identity.sign(kind:kind,tags:tags,content:content)
+        }
+    }
     var body: some View {
         Form {
             Section("Dialogue capture mode") {
@@ -38,7 +47,10 @@ struct NStackSettings: View {
                 TextField("https://your-nstack.example", text:$origin).textInputAutocapitalization(.never).autocorrectionDisabled().keyboardType(.URL)
                 Text(identity.npub ?? "Unlock your imported Nostr identity to discover destinations.").font(.footnote).textSelection(.enabled)
                 NavigationLink("Identity") { IdentitySettings(model:identity) }
-                Button("Discover workspaces") { discover() }.disabled(!identity.unlocked || loading)
+                Button("Find my Towers") { findTowers() }.disabled(!identity.unlocked || loading)
+                ForEach(towers) { tower in Button(tower.origin) { selectedTower = tower; seededOrigin = tower.origin; origin = tower.origin; discover() } .disabled(loading) }
+                Text("Selected Tower: " + (selectedTower?.origin ?? "Choose above or enter an HTTPS origin"))
+                Button("List workspaces at entered Tower") { discover() }.disabled(!identity.unlocked || loading)
                 if loading { ProgressView() }
                 if let notice { Text(notice).foregroundStyle(.secondary) }
             }
@@ -81,15 +93,17 @@ struct NStackSettings: View {
             .onAppear {
                 guard !restored else { return }; restored = true
                 loadSetup()
+                if identity.unlocked { findTowers() }
             }
             .onChange(of:captureMode) { _,_ in loadSetup() }
             .onChange(of:origin) { _,_ in
                 guard origin != seededOrigin else { return }
                 seededOrigin = nil
+                selectedTower = nil
                 reset()
                 if let d = savedRoute, d.origin == origin { restoreSelection(d) }
             }
-            .onChange(of:identity.npub) { _,_ in reset(); loadSetup() }
+            .onChange(of:identity.generation) { _,_ in towers = []; selectedTower = nil; reset(); loadSetup(); if identity.unlocked { findTowers() } }
     }
     var savedRoute: NStackDestination? {
         switch captureMode {
@@ -120,36 +134,51 @@ struct NStackSettings: View {
         let choices = NStackDiscovery.savedSelections(d)
         workspace = choices.workspace; channel = choices.channel
     }
-    func reset() { directoryStatus = nil; agents = []; manualRecipient = false; workspaces = []; channels = []; workspace = nil; channel = nil }
+    func reset() { discoveryGeneration = UUID(); directoryStatus = nil; agents = []; manualRecipient = false; workspaces = []; channels = []; workspace = nil; channel = nil }
+    func findTowers() {
+        let ticket = UUID(); discoveryGeneration = ticket
+        let signer = identity.npub; let epoch=identity.generation; loading = true; notice = "Discovering Towers…"
+        Task {
+            defer { if discoveryGeneration == ticket { loading = false } }
+            do {
+                let result = try await TowerDiscovery(identity).discover()
+                guard discoveryGeneration == ticket, identity.npub == signer, identity.generation == epoch else { return }
+                towers = result
+                notice = result.isEmpty ? "No verified Towers found. Retry or enter an HTTPS origin." : "Choose a Tower, then a workspace."
+            } catch { if discoveryGeneration == ticket, identity.npub == signer, identity.generation == epoch { notice = error.localizedDescription } }
+        }
+    }
     func discover() {
         reset(); loading = true; notice = nil
-        let requestedOrigin = origin; let signer = identity.npub
+        let requestedOrigin = origin; let signer = identity.npub; let epoch=identity.generation; let ticket = discoveryGeneration
+        let requestAPI=api
         Task {
-            defer { loading = false }
+            defer { if discoveryGeneration == ticket { loading = false } }
             do {
-                let entries = try await api.list(origin:requestedOrigin,path:"/api/v4/flightdeck-pg/workspaces",key:"workspaces")
-                guard origin == requestedOrigin, identity.npub == signer else { return }
-                workspaces = try entries.map { w in
-                    guard let i = w["identity"] as? [String:Any], let id = i["workspace_id"] as? String, let app = i["app_npub"] as? String, UUID(uuidString:id) != nil, NostrCodec.validNpub(app), let label = w["label"] as? String else { throw NStackError.malformed }
-                    return NStackChoice(id:id,label:label,app:app)
-                }
+                let result = try await requestAPI.workspaces(origin:requestedOrigin)
+                guard origin == requestedOrigin, identity.npub == signer, identity.generation == epoch, discoveryGeneration == ticket else { return }
+                guard selectedTower == nil || result.allSatisfy({$0.locator?.tower == selectedTower?.service}) else { throw NStackError.malformed }
+                workspaces = result
                 if workspaces.isEmpty { notice = "No accessible workspaces for this identity." }
-            } catch { notice = error.localizedDescription }
+            } catch { if discoveryGeneration == ticket, identity.npub == signer, identity.generation == epoch { notice = error.localizedDescription } }
         }
     }
     func select(_ w: NStackChoice, preserveChannel: Bool = false, preserveRecipient: Bool = false) {
+        discoveryGeneration = UUID(); let ticket = discoveryGeneration
         let retainedChannel = preserveChannel ? channel : nil
         workspace = w; agents = []; manualRecipient = false; channel = retainedChannel; channels = retainedChannel.map { [$0] } ?? []
         if !preserveRecipient { recipient = ""; recipientLabel = "" }
         loading = true
-        let requestedOrigin = origin; let signer = identity.npub
+        let requestedOrigin = origin; let signer = identity.npub; let epoch=identity.generation
+        let requestAPI=api
         Task {
-            defer { loading = false }
+            defer { if discoveryGeneration == ticket { loading = false } }
             do {
-                let descriptor = try await api.request(origin:requestedOrigin,path:"/api/v4/flightdeck-pg/workspaces/\(w.id)/descriptor",app:w.app)
+                if let locator = w.locator { try await requestAPI.verify(locator) }
+                let descriptor = try await requestAPI.request(origin:requestedOrigin,path:"/api/v4/flightdeck-pg/workspaces/\(w.id)/descriptor",app:w.app)
                 guard (descriptor["identity"] as? [String:Any])?["workspace_id"] as? String == w.id else { throw NStackError.malformed }
-                let discovery = try await api.discoverChannels(origin:requestedOrigin, workspace:w, signer:signer)
-                guard origin == requestedOrigin, identity.npub == signer, workspace?.id == w.id else { return }
+                let discovery = try await requestAPI.discoverChannels(origin:requestedOrigin, workspace:w, signer:signer)
+                guard origin == requestedOrigin, identity.npub == signer, identity.generation == epoch, discoveryGeneration == ticket, workspace?.id == w.id else { return }
                 agents = discovery.agents; manualRecipient = discovery.directoryError != nil
                 directoryStatus = discovery.directoryError.map { "Agent directory unavailable: " + $0 + " Retry workspace discovery or ask the workspace administrator for the canonical agent npub." }
                     ?? (agents.isEmpty ? "Agent directory loaded: no visible receiving agents are available." : "Choose a canonical receiving agent from the workspace directory.")
@@ -157,7 +186,10 @@ struct NStackSettings: View {
                 if let retainedChannel, discovery.channels.contains(where: { $0.id == retainedChannel.id }) { channel = retainedChannel }
                 else if preserveChannel { channel = nil }
                 notice = discovery.channelError ?? (channels.isEmpty ? "No accessible message channels." : discovery.labelNotice)
-            } catch { if origin == requestedOrigin, identity.npub == signer, workspace?.id == w.id { agents = []; manualRecipient = true; directoryStatus = "Discovery failed. Retry selecting the workspace."; channels = []; channel = nil; notice = error.localizedDescription } }
+                if let locator=w.locator {
+                    do { try await TowerDiscovery(identity).publish(locator) } catch { if origin == requestedOrigin, identity.npub == signer, identity.generation == epoch, discoveryGeneration == ticket, workspace?.id == w.id { notice = (notice ?? "") + " Workspace announcement pending. Select the workspace again to retry." } }
+                }
+            } catch { if origin == requestedOrigin, identity.npub == signer, identity.generation == epoch, discoveryGeneration == ticket, workspace?.id == w.id { agents = []; manualRecipient = true; directoryStatus = "Discovery failed. Retry selecting the workspace."; channels = []; channel = nil; notice = error.localizedDescription } }
         }
     }
 }
@@ -248,8 +280,9 @@ struct NStackChannelDiscovery {
 extension NStackAPI {
     /// Read every cursor page, refusing loops and capped responses that cannot prove completeness.
     func list(origin: String, path: String, app: String? = nil, key: String) async throws -> [[String:Any]] {
-        var entries: [[String:Any]] = []; var cursor: String?; var seen = Set<String>()
+        var entries: [[String:Any]] = []; var cursor: String?; var seen = Set<String>(); var pages = 0
         repeat {
+            pages += 1; guard pages <= 100 else { throw NStackError.discoveryLimit }
             var components = URLComponents(); components.queryItems = [URLQueryItem(name:"limit",value:"200")]
             if let cursor { components.queryItems!.append(URLQueryItem(name:"cursor",value:cursor)) }
             let response = try await request(origin:origin,path:path + "?" + components.percentEncodedQuery!,app:app)
@@ -257,7 +290,7 @@ extension NStackAPI {
             entries += page
             cursor = response["next_cursor"] as? String
             if let next = cursor { guard !next.isEmpty, seen.insert(next).inserted else { throw NStackError.malformed } }
-            else if response["has_more"] as? Bool == true || page.count >= 200 { throw NStackError.discoveryLimit }
+            else if response["has_more"] as? Bool == true || response["partial"] as? Bool == true || page.count >= 200 { throw NStackError.discoveryLimit }
         } while cursor != nil
         return entries
     }

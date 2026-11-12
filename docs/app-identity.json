@@ -1,0 +1,8 @@
+{
+  "name": "In Dialogue",
+  "package": "com.wingmanbefree.indialogue",
+  "derivation": "SHA256 UTF-8 org.wingman.nstack.app:com.wingmanbefree.indialogue:v1:0",
+  "app_pubkey": "166f8d10ed9d5480a05066fd23b0ce8c4b4807d0b43bc424648f9dc00bef114f",
+  "purpose": "Public NStack discovery namespace only; not a signer or an APK certificate.",
+  "app_npub": "npub1zehc6y8dn42gpgzsvm7j8vxw3395sp7sksaugfry37wuqzl0z98spkpgj0"
+}

@@ -8,6 +8,8 @@ data class AuthContext(val npub: String?, val generation: Long)
 
 data class SetupState(
     val origin: String = "",
+    val towers: List<TowerChoice> = emptyList(),
+    val selectedTower: TowerChoice? = null,
     val workspace: Choice? = null,
     val channel: Choice? = null,
     val workspaces: List<Choice> = emptyList(),
@@ -28,6 +30,8 @@ class NStackSetup(
     private val loadChannels: suspend (String, Choice, AuthContext) -> NStackAPI.Discovery,
     private val saved: Destination? = null,
     private val keepSeedChannel: Boolean = true,
+    private val loadTowers: suspend (AuthContext) -> List<TowerChoice> = { emptyList() },
+    private val publishIndex: suspend (WorkspaceLocator, AuthContext) -> Unit = { _, _ -> },
 ) {
     val state = MutableStateFlow(SetupState(origin = saved?.origin.orEmpty()))
     private var connection = auth()
@@ -112,6 +116,32 @@ class NStackSetup(
         return Ticket(generation, origin, connection, workspace?.id)
     }
 
+    fun discoverTowers() {
+        refreshIdentity()
+        val requested = connection
+        if (requested.npub == null) return
+        generation++
+        pending?.cancel()
+        val ticket = generation
+        state.value = state.value.copy(busy = true, notice = "Discovering Towers…")
+        pending = scope.launch {
+            try {
+                val towers = loadTowers(requested)
+                if (ticket == generation && auth() == requested) state.value = state.value.copy(towers = towers, notice = if (towers.isEmpty()) "No verified Towers found. Retry or enter an HTTPS origin." else "Choose a Tower, then a workspace.")
+            } catch (e: Exception) {
+                if (e !is CancellationException && ticket == generation && auth() == requested) state.value = state.value.copy(notice = e.message.orEmpty())
+            } finally { if (ticket == generation && auth() == requested) state.value = state.value.copy(busy = false) }
+        }
+    }
+
+    fun selectTower(tower: TowerChoice) {
+        require(tower in state.value.towers)
+        val towers = state.value.towers
+        clear(tower.origin)
+        state.value = state.value.copy(towers = towers, selectedTower = tower)
+        discover()
+    }
+
     fun discover() {
         val ticket =
             try {
@@ -124,6 +154,8 @@ class NStackSetup(
         pending = scope.launch {
             try {
                 val rows = loadWorkspaces(ticket.origin, ticket.auth)
+                val tower = state.value.selectedTower
+                check(tower == null || rows.all { it.locator?.tower == tower.service }) { "Selected Tower identity changed." }
                 if (valid(ticket))
                     state.value =
                         state.value.copy(
@@ -153,6 +185,8 @@ class NStackSetup(
         pending = scope.launch {
             try {
                 val result = loadChannels(ticket.origin, choice, ticket.auth)
+                var publicationNotice = ""
+                choice.locator?.let { w -> try { publishIndex(w,ticket.auth) } catch (e: CancellationException) { throw e } catch (_: Exception) { publicationNotice = " Workspace announcement pending. Select the workspace again to retry." } }
                 if (valid(ticket))
                     state.value =
                         state.value.copy(
@@ -162,7 +196,7 @@ class NStackSetup(
                             channels = result.channels,
                             agents = result.agents,
                             manualRecipient = result.directoryUnavailable,
-                            notice = result.notice,
+                            notice = result.notice + publicationNotice,
                         )
             } catch (e: Exception) {
                 if (valid(ticket) && e !is CancellationException)
