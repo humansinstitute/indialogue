@@ -1,6 +1,6 @@
 # In Dialogue for Android
 
-Native Kotlin / Jetpack Compose app, package `com.wingmanbefree.indialogue`, Android version 1.1.0 (version code 2). Android 9 (API 28) or newer, arm64 and x86_64. Targets Android 16 (API 36). iOS remains a separate native app.
+Native Kotlin / Jetpack Compose app, package `com.wingmanbefree.indialogue`, Android version 1.2.1 (version code 4). Android 9 (API 28) or newer, arm64 and x86_64. Targets Android 16 (API 36). iOS remains a separate native app.
 
 ## Build
 
@@ -58,3 +58,9 @@ Conversation checks run immediately and every 20 seconds only while the latest c
 A selected microphone must remain available and match Android's actual routed input after a one-second startup grace. Refusal or substitution stops capture and retains earlier segments. Choose System default explicitly to permit Android's default routing. Bluetooth/USB device behavior still needs physical-device verification.
 
 Android does not provide Apple's SpeechAnalyzer, Apple-managed model installation or Foundation Models APIs. It uses the documented Vosk and optional llama.cpp/Qwen engines. Android system TTS voices and languages depend on the installed engine/data; network-only voices are excluded. Menu → Diagnostics explicitly queues a private JSON report of up to 500 operational events from the last hour. Events use a fixed enum with timestamps: no raw errors, audio, transcript, messages, device names or key material are accepted. Reports use the selected immutable NStack destination, require matching unlock, and survive relaunch for retry in NStack uploads. No automatic telemetry runs. Finished local reports can be removed from upload history; remote copies remain. Unreadable event files fail closed and are retained. Recorder notices, recording events and upload history remain available locally. Live receiving-agent execution, real Bluetooth/USB routing, interruptions and OEM background behavior require separate release-owner/device validation.
+
+## Android adaptive launcher icon
+
+The manifest uses `@mipmap/ic_launcher` for both `icon` and `roundIcon`. Android 8+ selects the adaptive resource in `mipmap-anydpi-v26`, with independent full-bleed background and safe foreground layers. Earlier Android versions retain the legacy fallback. The navy background fills the mask; the existing red microphone badge is scaled to a 62.4 dp diameter on the 108 dp layer.
+
+When updating artwork, inspect both a circle and a squircle mask over the central 72 dp of the 108 dp layers, and keep essential foreground details within the central 66 dp safe circle. Check the merged release manifest and packaged resources, then run the app’s documented release build and lint. Launcher caches may need a normal refresh after an in-place update; never uninstall or clear user data to refresh an icon.
