@@ -248,10 +248,23 @@ fun DialogueUI(
                         }
                     }
                     if (inputs) {
-                        val devices =
-                            (context.getSystemService(AudioManager::class.java)).getDevices(
-                                AudioManager.GET_DEVICES_INPUTS
-                            )
+                        val audio = remember(context) { context.getSystemService(AudioManager::class.java) }
+                        var devices by remember { mutableStateOf(audio.getDevices(AudioManager.GET_DEVICES_INPUTS).toList()) }
+                        fun refreshInputs() { devices = audio.getDevices(AudioManager.GET_DEVICES_INPUTS).toList() }
+                        DisposableEffect(audio) {
+                            val callback = object : android.media.AudioDeviceCallback() {
+                                override fun onAudioDevicesAdded(added: Array<out android.media.AudioDeviceInfo>) { refreshInputs() }
+                                override fun onAudioDevicesRemoved(removed: Array<out android.media.AudioDeviceInfo>) { refreshInputs() }
+                            }
+                            audio.registerAudioDeviceCallback(callback, android.os.Handler(android.os.Looper.getMainLooper()))
+                            onDispose { audio.unregisterAudioDeviceCallback(callback) }
+                        }
+                        Text("Choose a connected microphone. Clearing removes this app's saved selection; it does not unpair Bluetooth devices or delete recordings.", style = MaterialTheme.typography.bodySmall)
+                        TextButton(onClick = { refreshInputs() }) { Text("Refresh microphones") }
+                        TextButton(onClick = {
+                            app.action { app.clearSavedMicrophones() }
+                            refreshInputs()
+                        }, enabled = active == null && !pending) { Text("Clear saved microphones") }
                         TextButton(
                             onClick = {
                                 app.action { app.chooseInput(null) }

@@ -1,6 +1,6 @@
 # In Dialogue for Android
 
-Native Kotlin / Jetpack Compose app, package `com.wingmanbefree.indialogue`, Android version 1.2.1 (version code 4). Android 9 (API 28) or newer, arm64 and x86_64. Targets Android 16 (API 36). iOS remains a separate native app.
+Native Kotlin / Jetpack Compose app, package `com.wingmanbefree.indialogue`, Android version 1.2.2 (version code 5). Android 9 (API 28) or newer, arm64 and x86_64. Targets Android 16 (API 36). iOS remains a separate native app.
 
 ## Build
 
@@ -64,3 +64,7 @@ Android does not provide Apple's SpeechAnalyzer, Apple-managed model installatio
 The manifest uses `@mipmap/ic_launcher` for both `icon` and `roundIcon`. Android 8+ selects the adaptive resource in `mipmap-anydpi-v26`, with independent full-bleed background and safe foreground layers. Earlier Android versions retain the legacy fallback. The navy background fills the mask; the existing red microphone badge is scaled to a 62.4 dp diameter on the 108 dp layer.
 
 When updating artwork, inspect both a circle and a squircle mask over the central 72 dp of the 108 dp layers, and keep essential foreground details within the central 66 dp safe circle. Check the merged release manifest and packaged resources, then run the app’s documented release build and lint. Launcher caches may need a normal refresh after an in-place update; never uninstall or clear user data to refresh an icon.
+
+## Clear a stale microphone selection
+
+On Capture, open the microphone control and tap **Clear saved microphones**. This removes the app's persisted input preference and clears its displayed route, returning to System default. Recordings, identity, delivery settings and Android Bluetooth pairings are preserved. Select the currently connected headset again before recording. **Refresh microphones** reloads Android's current input list; opening the picker also reads it afresh, and connection changes refresh it while open. Android may retain its own Bluetooth device name; this action cannot erase the operating system's Bluetooth cache. Clearing is unavailable during capture. A selected microphone still has to match the actual route; the reset does not bypass that check.

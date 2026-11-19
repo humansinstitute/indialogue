@@ -111,9 +111,7 @@ class DialogueApp : Application() {
             notice.value = "Retention settings unreadable; automatic deletion disabled."
         }
         try {
-            File(root, "input.json").readTextOrNull()?.let {
-                preferredInput = codec.decodeFromString(it)
-            }
+            reloadInputPreference()
         } catch (e: Exception) {
             notice.value = "Microphone preference unreadable; using system default."
         }
@@ -134,6 +132,20 @@ class DialogueApp : Application() {
         } else atomic(File(root, "input.json"), codec.encodeToString(preference))
         preferredInput = preference
         input.value = device?.id ?: 0
+        refresh()
+    }
+
+    internal fun reloadInputPreference() {
+        preferredInput = File(root, "input.json").readTextOrNull()?.let { codec.decodeFromString<InputPreference>(it) }
+    }
+
+    fun clearSavedMicrophones() {
+        check(active.value == null && !capturePending.value) { "Stop recording before clearing microphones." }
+        clearInputPreference(File(root, "input.json"))
+        preferredInput = null
+        input.value = 0
+        route.value = "System default"
+        notice.value = "Saved microphone cleared. Choose your connected microphone again. Recordings and Bluetooth pairings are unchanged."
         refresh()
     }
 
