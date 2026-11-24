@@ -14,41 +14,61 @@ internal interface CommunicationRoute {
     fun clearCommunicationDevice()
     fun startBluetoothSco()
     fun stopBluetoothSco()
+    var audioMode: Int
 }
 
 internal fun needsCommunicationRoute(type: Int) =
     type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO || (Build.VERSION.SDK_INT >= 31 && type == AudioDeviceInfo.TYPE_BLE_HEADSET)
 
-/** Requests and later releases the Bluetooth communication route around one capture. */
+internal const val MODE_NORMAL = 0
+internal const val MODE_IN_COMMUNICATION = 3
+
+/** Requests and later releases the Bluetooth communication route around one capture; never throws. */
 internal class InputRouteSession(private val route: CommunicationRoute) {
     private var engaged = false
     private var legacy = false
+    private var previousMode: Int? = null
 
-    /** True when no negotiation is needed or it was requested; false when Android refused it. */
-    fun engage(preferred: RouteDevice?): Boolean {
-        if (preferred == null || !needsCommunicationRoute(preferred.type)) return true
-        if (route.sdkInt >= 31) {
-            val sink = route.communicationDevices()
-                .firstOrNull { it.type == preferred.type && it.address == preferred.address } ?: return false
-            engaged = route.setCommunicationDevice(sink.id)
-            return engaged
+    /** Null when no negotiation is needed or it was requested; otherwise why Android refused it. */
+    fun engage(preferred: RouteDevice?): String? {
+        if (preferred == null || !needsCommunicationRoute(preferred.type)) return null
+        try {
+            previousMode = route.audioMode
+            route.audioMode = MODE_IN_COMMUNICATION
+            if (route.sdkInt >= 31) {
+                val sink = route.communicationDevices()
+                    .firstOrNull { it.type == preferred.type && it.address == preferred.address }
+                    ?: return refuse("Android lists no communication device for this headset.")
+                engaged = route.setCommunicationDevice(sink.id)
+                if (!engaged) return refuse("Android refused the Bluetooth communication route.")
+            } else {
+                route.startBluetoothSco()
+                engaged = true
+                legacy = true
+            }
+            return null
+        } catch (e: Exception) {
+            return refuse("Bluetooth route request failed: ${e.message}")
         }
-        route.startBluetoothSco()
-        engaged = true
-        legacy = true
-        return true
     }
 
+    private fun refuse(reason: String): String { release(); return reason }
+
     fun release() {
-        if (!engaged) return
-        if (legacy) route.stopBluetoothSco() else route.clearCommunicationDevice()
-        engaged = false
-        legacy = false
+        val wasEngaged = engaged
+        val wasLegacy = legacy
+        val mode = previousMode
+        engaged = false; legacy = false; previousMode = null
+        if (wasEngaged) runCatching { if (wasLegacy) route.stopBluetoothSco() else route.clearCommunicationDevice() }
+        if (mode != null) runCatching { route.audioMode = mode }
     }
 }
 
 internal class AndroidCommunicationRoute(private val audio: AudioManager) : CommunicationRoute {
     override val sdkInt get() = Build.VERSION.SDK_INT
+    override var audioMode: Int
+        get() = audio.mode
+        set(value) { audio.mode = value }
     private fun AudioDeviceInfo.toRoute() = RouteDevice(id, type, address)
     private val sinks = mutableMapOf<Int, AudioDeviceInfo>()
 

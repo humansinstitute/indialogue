@@ -184,8 +184,9 @@ class CaptureService : Service() {
         bluetoothInput = needsCommunicationRoute(preferred.type)
         val session = InputRouteSession(AndroidCommunicationRoute(audio))
         inputRoute = session
-        if (!session.engage(RouteDevice(preferred.id, preferred.type, preferred.address)))
-            record?.let { it.events += "Android did not accept the Bluetooth communication route for ${preferred.productName}."; app.library.save(it) }
+        session.engage(RouteDevice(preferred.id, preferred.type, preferred.address))?.let { why ->
+            record?.let { it.events += "$why (${preferred.productName})"; app.library.save(it) }
+        }
     }
 
     @Suppress("DEPRECATION")
