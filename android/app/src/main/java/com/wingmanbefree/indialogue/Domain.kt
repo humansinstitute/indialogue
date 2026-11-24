@@ -245,8 +245,11 @@ data class Retention(val enabled: Boolean = false, val days: Int = 30) {
 @Serializable data class InputPreference(val type: Int, val name: String, val address: String)
 
 /** Selected inputs must be verified after the bounded startup grace. Never silently substitute. */
-fun inputRouteAllowed(selected: Boolean, preferredId: Int?, actualId: Int?, elapsedMs: Long): Boolean =
-    !selected || (preferredId != null && actualId == preferredId) || (preferredId != null && elapsedMs < 1000)
+/** SCO/HFP link set-up commonly takes seconds; wired and built-in inputs settle within the default window. */
+const val bluetoothVerificationGraceMs = 5000L
+
+fun inputRouteAllowed(selected: Boolean, preferredId: Int?, actualId: Int?, elapsedMs: Long, graceMs: Long = 1000): Boolean =
+    !selected || (preferredId != null && actualId == preferredId) || (preferredId != null && elapsedMs < graceMs)
 
 fun automaticDelivery(route: DialogueRoute?, audioOnly: Boolean): Destination? =
     route?.destination?.takeIf { audioOnly || it.automatic }

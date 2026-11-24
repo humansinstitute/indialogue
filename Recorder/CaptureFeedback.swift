@@ -68,12 +68,15 @@ struct CaptureLevelView: View {
     }
 }
 
+// HFP link set-up for Bluetooth headsets commonly takes seconds, so budget 5s of 50ms polls.
+let captureInputWaitAttempts = 100
+
 // Injectable waits let regressions exercise delayed selection without audio hardware.
 @MainActor
 func waitForPreferredCaptureInput(uid: String?, current: () -> [CaptureInput], interrupted: () -> Bool,
                                   ready: () -> Bool = { true },
                                   wait: () async throws -> Void = { try await Task.sleep(for: .milliseconds(50)) }) async throws {
-    for _ in 0..<20 {
+    for _ in 0..<captureInputWaitAttempts {
         if (CaptureInputPolicy.matches(uid: uid, inputs: current()) && ready()) || interrupted() { return }
         try await wait()
     }

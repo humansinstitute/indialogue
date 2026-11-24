@@ -40,6 +40,8 @@ class CaptureService : Service() {
         }
     private var lastRoute: Int? = null
     private var selectedInputVerified = false
+    private var inputRoute: InputRouteSession? = null
+    private var bluetoothInput = false
     private val recordingCallback =
         object : AudioManager.AudioRecordingCallback() {
             override fun onRecordingConfigChanged(
@@ -138,6 +140,7 @@ class CaptureService : Service() {
                     .newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "InDialogue:capture")
                     .apply { acquire(12 * 60 * 60 * 1000L) }
             start = SystemClock.elapsedRealtime()
+            negotiateInputRoute()
             openSegment()
             app.refresh()
             timer =
@@ -175,6 +178,16 @@ class CaptureService : Service() {
         return START_NOT_STICKY
     }
 
+    /** A selected Bluetooth headset mic is not the actual input until Android sets up its communication route. */
+    private fun negotiateInputRoute() {
+        val preferred = app.preferredDevice() ?: return
+        bluetoothInput = needsCommunicationRoute(preferred.type)
+        val session = InputRouteSession(AndroidCommunicationRoute(audio))
+        inputRoute = session
+        if (!session.engage(RouteDevice(preferred.id, preferred.type, preferred.address)))
+            record?.let { it.events += "Android did not accept the Bluetooth communication route for ${preferred.productName}."; app.library.save(it) }
+    }
+
     @Suppress("DEPRECATION")
     private fun openSegment() {
         val r = checkNotNull(record)
@@ -206,7 +219,8 @@ class CaptureService : Service() {
         val device = recorder?.routedDevice
         val preferred = app.preferredDevice()
         if (!inputRouteAllowed(app.preferredInput != null, preferred?.id, device?.id,
-                if (selectedInputVerified) 1000 else SystemClock.elapsedRealtime() - start)) {
+                if (selectedInputVerified) 1000 else SystemClock.elapsedRealtime() - start,
+                if (bluetoothInput && !selectedInputVerified) bluetoothVerificationGraceMs else 1000)) {
             stopCapture("Selected microphone was not verified or changed. Capture stopped; earlier audio retained. Reconnect it or explicitly choose System default.")
             return
         }
@@ -270,6 +284,8 @@ class CaptureService : Service() {
         app.active.value = null
         app.capturePending.value = false
         app.levels.value = emptyList()
+        inputRoute?.release()
+        inputRoute = null
         focus?.let { audio.abandonAudioFocusRequest(it) }
         focus = null
         wake?.let { if (it.isHeld) it.release() }

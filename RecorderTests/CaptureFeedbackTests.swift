@@ -52,7 +52,7 @@ extension CaptureFeedbackTests {
         XCTAssertEqual(route, [bluetooth])
         waits = 0; route = [phone]
         try await waitForPreferredCaptureInput(uid: bluetooth.uid, current: { route }, interrupted: { false }, wait: { waits += 1 })
-        XCTAssertEqual(waits, 20)
+        XCTAssertEqual(waits, captureInputWaitAttempts)
         XCTAssertEqual(route, [phone]) // Never relabel preference as actual.
         waits = 0
         try await waitForPreferredCaptureInput(uid: nil, current: { route }, interrupted: { false }, wait: { waits += 1 })
@@ -63,6 +63,16 @@ extension CaptureFeedbackTests {
 }
 
 extension CaptureFeedbackTests {
+    // Bluetooth HFP can take over a second to become the actual input; a 1s budget rejected a working headset.
+    @MainActor func testSlowBluetoothRouteWithinBudgetIsAccepted() async throws {
+        var route = [phone], waits = 0
+        try await requestVerifiedCaptureInput(uid: bluetooth.uid, name: "AirPods", request: {},
+            current: { route }, interrupted: { false }, wait: {
+                waits += 1
+                if waits == 40 { route = [self.bluetooth] } // 2s at 50ms polls
+            })
+        XCTAssertEqual(route, [bluetooth]); XCTAssertEqual(waits, 40)
+    }
     func testStrictPreferenceRejectsVanAndEmptyInputButSystemRemainsExplicit() {
         let van = CaptureInput(uid: "van", source: nil, name: "Van")
         XCTAssertFalse(CaptureInputPolicy.matches(uid: bluetooth.uid, inputs: [van]))
@@ -90,7 +100,7 @@ extension CaptureFeedbackTests {
             XCTAssertTrue(error.localizedDescription.contains("AirPods"))
             XCTAssertTrue(error.localizedDescription.contains("Phone"))
         }
-        XCTAssertEqual(requests, 2); XCTAssertEqual(waits, 20); XCTAssertEqual(route, [phone])
+        XCTAssertEqual(requests, 2); XCTAssertEqual(waits, captureInputWaitAttempts); XCTAssertEqual(route, [phone])
         do {
             try await requestVerifiedCaptureInput(uid: bluetooth.uid, name: "AirPods", request: {},
                 current: { [self.bluetooth] }, interrupted: { true }, wait: { XCTFail("Interrupted selection must not wait") })
@@ -185,6 +195,6 @@ extension CaptureFeedbackTests {
                 current: { [self.phone] }, interrupted: { false }, ready: { running }, wait: { waits += 1 })
             XCTFail("Stopped capture cannot be reported as a successful switch")
         } catch {}
-        XCTAssertEqual(waits, 20)
+        XCTAssertEqual(waits, captureInputWaitAttempts)
     }
 }
