@@ -819,6 +819,7 @@ class Transfers(val root: File) {
             check(intact) {
                 "Local snapshot checksum/size changed; refused."
             }
+            val retainedObject = f.objectId != null
             if (f.objectId == null) {
                 check(!f.preparing) {
                     "Storage prepare uncertain. Cannot safely allocate twice; review remote storage before cancelling."
@@ -856,6 +857,20 @@ class Transfers(val root: File) {
             val objectPath = "/api/v4/storage/${f.objectId}"
             var meta = api.request(d.origin, objectPath)
             if (meta["completed_at"] == null || meta["completed_at"] == JsonNull) {
+                if (retainedObject) {
+                    val refreshed = api.request(d.origin, "$objectPath/upload-url", method = "POST", body = buildJsonObject {})
+                    check(refreshed.text("object_id") == f.objectId) { "Upload refresh returned another object; refused." }
+                    if (refreshed["completed_at"] != null && refreshed["completed_at"] != JsonNull) {
+                        NStackAPI.validateMetadata(refreshed, f)
+                        f.complete = true
+                        persist()
+                        continue
+                    }
+                    f.uploadUrl = refreshed.text("upload_url")?.takeIf { it.isNotBlank() }
+                        ?: error("Upload refresh missing URL; original snapshot retained.")
+                    persist()
+                }
+                gate()
                 api.put(path, f.uploadUrl!!, d, f)
                 api.request(
                     d.origin,

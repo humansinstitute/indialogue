@@ -74,3 +74,11 @@ xcodebuild -project Recorder.xcodeproj -scheme PeteRecorder -configuration Relea
 ```
 
 Use Organizer → Distribute App → App Store Connect → Upload, then verify processed build **16** in App Store Connect before claiming TestFlight availability. Export/upload by CLI requires an owner-provided App Store export options plist and existing credentials; none are embedded or assumed here. Validate manual report attachment/reference, lock/offline/reopen recovery and actual capture continuity on the physical device before wider release.
+
+## Expired upload recovery — version 1.3 build 20
+
+Update in place with the same bundle ID, signing team, recordings, Keychain and transfer ledger. Build 20 renews an unfinished upload's URL through the additive NStack same-object refresh endpoint before a new PUT. Activate the reviewed backend endpoint before rollout. A failed or unavailable refresh retains the original snapshot and IDs. Completed remote objects are validated and reused; an attached background task or persisted successful PUT is not restarted just to renew its URL.
+
+Use the existing archive/Organizer procedure above for build **20**. An automatic-signing archive may use the existing development identity; App Store Connect export/upload must resolve the existing distribution profile. Verify the processed build in App Store Connect before claiming TestFlight availability. A signed archive by itself establishes neither upload nor tester availability. Missing established export options, API key/issuer metadata or upload/readback tooling must be reported to the release owner.
+
+Review Retry on a synthetic job whose saved presigned URL has expired. Confirm the exact original object IDs, snapshot/request ID, destination and attachment bytes are retained and one message is accepted. Also verify completed-object reuse and denied refresh with no replacement prepare. This regression does not establish the cause of any historical device-specific 403.

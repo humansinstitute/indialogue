@@ -1,6 +1,6 @@
 # In Dialogue for Android
 
-Native Kotlin / Jetpack Compose app, package `com.wingmanbefree.indialogue`, Android version 1.2.2 (version code 5). Android 9 (API 28) or newer, arm64 and x86_64. Targets Android 16 (API 36). iOS remains a separate native app.
+Native Kotlin / Jetpack Compose app, package `com.wingmanbefree.indialogue`, Android version 1.2.4 (version code 7). Android 9 (API 28) or newer, arm64 and x86_64. Targets Android 16 (API 36). iOS remains a separate native app.
 
 ## Build
 
@@ -33,7 +33,7 @@ Use your own imported identity, an HTTPS origin, a discovered workspace and chan
 
 Immutable exports contain full raw and reviewed transcripts, full AAC audio, capture metadata, checksums, original destination and stable request ID. Unaccepted cleanup drafts stay local. Private workspace prepare is persisted before PUT; ambiguous prepare refuses duplicate allocation. API fallback upload is limited to 8 MiB. Presigned PUT carries no Nostr auth. Complete requires metadata readback with exact size and SHA-256; these checksums are server lifecycle metadata, not an independent remote byte digest. Signed calls stay at the selected HTTPS origin and refuse redirects. Kind 27235 binds exact URL/method/body bytes; kind 33358 binds exact instruction/body hash/workspace/channel. Visible canonical mentions and structured mentions derive from the same identity.
 
-Retry retains the original snapshot, destination, signer, object IDs and message request ID. Completed remote objects are revalidated and reused. Cancellation cannot retract a remote commit. Expired presigned URLs have no refresh API in the existing backend and need operator review. Uploads require foreground, idle capture and the matching unlocked identity. No background upload or remote deletion guarantee exists.
+Retry retains the original snapshot, destination, signer, object IDs and message request ID. Completed remote objects are revalidated and reused. Cancellation cannot retract a remote commit. Retry renews an unfinished object through signed `POST /api/v4/storage/:id/upload-url`, retaining that exact object and snapshot. This requires the additive Tower endpoint to be active. Denial or an unavailable endpoint leaves the job failed with files retained; no replacement object is prepared. Completed responses are validated and reused without PUT. Uploads require foreground, idle capture and the matching unlocked identity. No background upload or remote deletion guarantee exists.
 
 ## Licenses and model provenance
 

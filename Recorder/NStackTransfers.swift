@@ -486,6 +486,21 @@ final class NStackTransfers: ObservableObject {
                     if jobs[i].files[f].backgroundTaskID != nil {
                         jobs[i].state = "background_uploading"; try persist(); return
                     }
+                    // A retained object outlives its short-lived bearer URL. Renew only
+                    // before a new PUT, never while a background task is still attached
+                    // or after its successful delegate result has been persisted.
+                    if file.objectID != nil {
+                        let refreshed = try await api.request(origin:d.origin,path:"/api/v4/storage/\(object)/upload-url",method:"POST",body:[:])
+                        guard refreshed["object_id"] as? String == object else { throw NStackError.malformed }
+                        if try StorageMetadata.isCompleted(refreshed) {
+                            try StorageMetadata.validateCompleted(refreshed,file:file)
+                            jobs[i].files[f].complete = true; try persist()
+                            continue
+                        }
+                        guard let upload = refreshed["upload_url"] as? String, !upload.isEmpty else { throw NStackError.malformed }
+                        jobs[i].files[f].uploadURL = upload
+                        try persist() // URL renewal cannot change object/snapshot/request identity.
+                    }
                     let description = Self.backgroundDescription(job:jobs[i].id,file:file.name)
                     if let task = try await api.makeBackgroundPut(path,upload:jobs[i].files[f].uploadURL!,origin:d.origin,object:object,mime:file.mime,size:file.size,description:description) {
                         jobs[i].files[f].backgroundTaskID = task.identifier

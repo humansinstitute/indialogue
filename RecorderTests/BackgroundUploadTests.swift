@@ -38,6 +38,8 @@ final class BackgroundBackend {
     var prepares = 0
     var completes = 0
     var posts = 0
+    var refreshes: [String] = []
+    var denyRefresh = false
     var objects: [String:(Int,String,Bool)] = [:]
 }
 
@@ -80,6 +82,13 @@ final class BackgroundUploadTests: XCTestCase {
             }
             if path.hasSuffix("/messages") { box.posts += 1; return (201,["message":["id":UUID().uuidString]]) }
             let id = path.split(separator:"/")[3].description
+            if path.hasSuffix("/upload-url") {
+                XCTAssertEqual(request.httpMethod,"POST")
+                XCTAssertNotNil(request.value(forHTTPHeaderField:"Authorization"))
+                if box.denyRefresh { return (404,["error":"not writable"]) }
+                box.refreshes.append(id)
+                return (200,["object_id":id,"upload_url":"https://storage.example/private/\(id)?signature=fresh"])
+            }
             if path.hasSuffix("/complete") { box.completes += 1; box.objects[id]!.2 = true; return (200,[:]) }
             let object = box.objects[id]!
             var result:[String:Any] = ["size_bytes":object.0,"sha256_hex":object.1]
@@ -159,6 +168,56 @@ final class BackgroundUploadTests: XCTestCase {
         queue.retry(queue.jobs[0].id)
         try await wait { background.live.count == 1 }
         XCTAssertEqual(queue.jobs[0].files[0].objectID,object); XCTAssertEqual(backend.prepares,1)
+    }
+
+    func testExpiredRetryRefreshesSameObjectAndRetainsSnapshot() async throws {
+        let root = temp(); defer { try? FileManager.default.removeItem(at:root) }
+        let background = FakeBackgroundUploads(); let backend = installBackend()
+        let queue = try makeQueue(root:root,background:background)
+        let snapshot = queue.jobs[0]
+        queue.setAvailability(active:true,signer:npub,api:api(background))
+        try await wait { background.live.count == 1 }
+        let object = try XCTUnwrap(queue.jobs[0].files[0].objectID)
+        let file = queue.jobs[0].files[0]
+        let bytes = try Data(contentsOf:root.appendingPathComponent(snapshot.id.uuidString).appendingPathComponent(file.name))
+        background.finish(background.live[0].identifier,status:403)
+        try await wait { queue.jobs[0].state == "failed" }
+        let restored = NStackTransfers(root:root)
+        restored.setAvailability(active:true,signer:npub,api:api(background))
+        restored.retry(snapshot.id)
+        try await wait { background.live.count == 1 }
+        XCTAssertEqual(backend.refreshes,[object])
+        XCTAssertEqual(background.requests.last?.url?.query,"signature=fresh")
+        XCTAssertEqual(restored.jobs[0].id,snapshot.id)
+        XCTAssertEqual(restored.jobs[0].body,snapshot.body)
+        XCTAssertEqual(restored.jobs[0].destination,snapshot.destination)
+        XCTAssertEqual(restored.jobs[0].files[0].objectID,object)
+        XCTAssertEqual(try Data(contentsOf:root.appendingPathComponent(snapshot.id.uuidString).appendingPathComponent(file.name)),bytes)
+        XCTAssertEqual(backend.prepares,1)
+        background.finish(background.live[0].identifier)
+        try await wait { background.live.count == 1 && restored.jobs[0].files[0].complete }
+        background.finish(background.live[0].identifier)
+        try await wait { restored.jobs[0].state == "sent" }
+        XCTAssertEqual(backend.posts,1)
+        XCTAssertEqual(backend.prepares,2)
+    }
+
+    func testRefreshDenialRetainsObjectWithoutPutOrReplacementPrepare() async throws {
+        let root = temp(); defer { try? FileManager.default.removeItem(at:root) }
+        let background = FakeBackgroundUploads(); let backend = installBackend()
+        let queue = try makeQueue(root:root,background:background)
+        queue.setAvailability(active:true,signer:npub,api:api(background))
+        try await wait { background.live.count == 1 }
+        let object = queue.jobs[0].files[0].objectID
+        background.finish(background.live[0].identifier,status:403)
+        try await wait { queue.jobs[0].state == "failed" }
+        backend.denyRefresh = true
+        queue.retry(queue.jobs[0].id)
+        try await wait { queue.jobs[0].state == "failed" }
+        XCTAssertEqual(background.requests.count,1)
+        XCTAssertEqual(queue.jobs[0].files[0].objectID,object)
+        XCTAssertEqual(backend.prepares,1)
+        XCTAssertEqual(backend.posts,0)
     }
 
     func testLockedAndMismatchedIdentityPauseFinalizationThenUnlockResumes() async throws {

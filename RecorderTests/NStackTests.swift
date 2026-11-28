@@ -587,6 +587,10 @@ extension NStackTests {
         var prepares = 0; var puts = 0
         MockNStackProtocol.handler = { request in
             if request.url!.path.hasSuffix("/prepare") { prepares += 1; let id = UUID().uuidString; return (201,["object_id":id,"upload_url":"https://nstack.example/api/v4/storage/" + id]) }
+            if request.url!.path.hasSuffix("/upload-url") {
+                let id = request.url!.path.split(separator:"/")[3].description
+                return (200,["object_id":id,"upload_url":"https://nstack.example/api/v4/storage/" + id])
+            }
             if request.httpMethod == "PUT" { puts += 1; throw URLError(.notConnectedToInternet) }
             return (200,[:])
         }

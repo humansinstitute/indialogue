@@ -302,6 +302,83 @@ class NStackTest {
     }
 
     @Test
+    fun expiredRetryRefreshesSameObjectAndPreservesSnapshotBytes() = runBlocking {
+        val root = root()
+        val (server, client) = server()
+        try {
+            val identity = identity(root)
+            val d = destination(identity, server.url("/").toString().trimEnd('/'))
+            val transfers = Transfers(File(root, "transfers"))
+            val job = transfers.snapshot(Recording(state = "saved", raw = "raw", edited = "reviewed", speech = "complete"), d,
+                { it.writeText("immutable audio fixture") }, emptyList())
+            val originalId = job.id
+            val originalBody = job.body
+            val objects = mutableMapOf<String, Pair<Long, String>>()
+            val uploaded = mutableMapOf<String, ByteArray>()
+            val completed = mutableSetOf<String>()
+            var prepares = 0
+            var refreshes = 0
+            var posts = 0
+            server.dispatcher = object : Dispatcher() {
+                override fun dispatch(request: RecordedRequest): MockResponse {
+                    val path = request.requestUrl!!.encodedPath
+                    if (path.startsWith("/blob/")) {
+                        assertNull(request.getHeader("Authorization"))
+                        val id = path.substringAfterLast('/')
+                        if (request.requestUrl!!.queryParameter("token") == "expired") return MockResponse().setResponseCode(403)
+                        assertFalse(completed.contains(id))
+                        uploaded[id] = request.body.readByteArray()
+                        return response("{}")
+                    }
+                    assertNotNull(request.getHeader("Authorization"))
+                    if (path.endsWith("/prepare")) {
+                        prepares++
+                        val body = codec.parseToJsonElement(request.body.readUtf8()).jsonObject
+                        val id = uuid()
+                        objects[id] = body["size_bytes"]!!.jsonPrimitive.long to body.text("sha256_hex")!!
+                        return response("""{"object_id":"$id","upload_url":"${server.url("/blob/$id?token=${if (prepares == 1) "expired" else "fresh"}")}"}""")
+                    }
+                    if (path.endsWith("/messages")) {
+                        posts++
+                        val body = codec.parseToJsonElement(request.body.readUtf8()).jsonObject
+                        assertEquals(originalId, body.text("client_request_id"))
+                        assertEquals(originalBody, body.text("body"))
+                        return response("""{"message":{"id":"accepted"}}""")
+                    }
+                    val id = path.split('/')[4]
+                    if (path.endsWith("/upload-url")) {
+                        assertEquals("POST", request.method)
+                        assertFalse(completed.contains(id))
+                        refreshes++
+                        return response("""{"object_id":"$id","upload_url":"${server.url("/blob/$id?token=fresh")}"}""")
+                    }
+                    if (path.endsWith("/complete")) {
+                        assertEquals(objects[id]!!.second, sha(uploaded[id]!!))
+                        completed += id
+                        return response("{}")
+                    }
+                    val f = objects[id]!!
+                    return response("""{"completed_at":${if (id in completed) "\"2026-11-28\"" else "null"},"size_bytes":${f.first},"sha256_hex":"${f.second}"}""")
+                }
+            }
+            val api = NStackAPI(identity, client = client)
+            assertTrue(runCatching { transfers.send(job, api, {}) }.isFailure)
+            val objectId = job.files.first().objectId
+            job.state = "failed"; transfers.persist()
+            val restored = Transfers(transfers.root)
+            val retry = restored.jobs.single()
+            restored.retry(retry)
+            restored.send(retry, api, {})
+            assertEquals("sent", retry.state)
+            assertEquals(objectId, retry.files.first().objectId)
+            assertEquals(2, prepares)
+            assertTrue(refreshes >= 1)
+            assertEquals(1, posts)
+            retry.files.forEach { f -> assertArrayEquals(File(restored.root, "${retry.id}/${f.name}").readBytes(), uploaded[f.objectId]) }
+        } finally { server.shutdown(); root.deleteRecursively() }
+    }
+
+    @Test
     fun uncertainPrepareAndSnapshotTamperNeverAllocateAgain() = runBlocking {
         val root = root()
         val (s, client) = server()
